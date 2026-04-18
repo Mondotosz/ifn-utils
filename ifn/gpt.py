@@ -6,7 +6,6 @@ import uuid
 from .utils import console
 from rich.console import Group, RenderableType
 from rich.table import Table
-from rich.rule import Rule
 from rich.panel import Panel
 
 
@@ -73,7 +72,11 @@ def gpt_analyze(file: Annotated[Path, typer.Argument(exists=True)]):
         return
 
     # --- Print Header Information ---
-    header_table = Table(show_header=True)
+    header_table = Table(
+        show_header=True,
+        box=None,
+        header_style="bold yellow",
+    )
     header_table.add_column("Field", style="magenta")
     header_table.add_column("Offset", justify="center")
     header_table.add_column("Value", style="green")

@@ -2,7 +2,11 @@ import typer
 from typing import Annotated
 from pathlib import Path
 import struct
-from .utils import format_offset
+from .utils import console
+from rich.console import Group, RenderableType
+from rich.table import Table
+from rich.panel import Panel
+from rich.rule import Rule
 
 mbr_app = typer.Typer(help="MBR specific tools")
 
@@ -71,7 +75,7 @@ def get_addressing_mode(p_type: int, start_lba: int) -> str:
 def parse_mbr_id(data: bytes):
     # Located at offset 440 (0x1B8), 4 bytes long
     disk_id = data[440:444]
-    return disk_id.hex().upper()
+    return disk_id[::-1].hex().upper()
 
 
 @mbr_app.command("analyze")
@@ -84,21 +88,45 @@ def analyze(
         raise typer.Exit(1)
 
     disk_id = parse_mbr_id(data)
-    typer.secho(f"MBR Disk Identifier: {disk_id} at 0x1B8", fg="cyan", bold=True)
 
     # MBR Signature at 0x1FE
     sig = data[510:512]
-    typer.secho(
-        f"MBR Signature: {sig[::-1].hex().upper()} at 0x1FE", fg="cyan", bold=True
-    )
-    print("=" * 60)
 
+    is_gpt_protective = any(data[0x1BE + (i * 16) + 4] == 0xEE for i in range(4))
+    label_type = "gpt (protective)" if is_gpt_protective else "dos"
+
+    header_table = Table(
+        show_header=True,
+        box=None,
+        header_style="bold yellow",
+    )
+    header_table.add_column("Field", style="magenta")
+    header_table.add_column("Offset", justify="center")
+    header_table.add_column("Value", style="green")
+
+    header_table.add_row("Disklabel type", "", label_type)
+    header_table.add_row("MBR Disk Identifier", hex(0x1B8), disk_id)
+    header_table.add_row("MBR Signature", hex(0x1FE), sig.hex().upper())
+
+    console.print(
+        Panel(
+            header_table,
+            title="[bold cyan]MBR headers[/bold cyan]",
+            border_style="bright_blue",
+            expand=False,
+        )
+    )
+
+    parts: list[RenderableType] = []
     for i in range(4):
         base = 0x1BE + (i * 16)
         p = data[base : base + 16]
 
         p_type_id = p[4]
         if p_type_id == 0x00:  # Skip empty
+            parts.append(
+                Rule(title=f"[bold red]No partition #{i}[/bold red]", style="red")
+            )
             continue
 
         # Extracting LBA values (Little Endian 4-byte integers)
@@ -110,32 +138,48 @@ def analyze(
         # Extracting CHS values
         start_c, start_h, start_s = parse_chs(p[1:4])
         end_c, end_h, end_s = parse_chs(p[5:8])
-        typer.secho(f"Partition #{i + 1} [{mode} Mode]", fg="yellow", bold=True)
 
-        # Table of information
-        print(f"{'Field':<25} | {'Offset':<8} | {'Value'}")
-        print("-" * 50)
-        print(
-            f"{'Boot Flag':<25} | {format_offset(base):<8} | {hex(p[0])} ({'Bootable' if p[0] == 0x80 else 'No'})"
+        part_table = Table(
+            box=None,
+            show_header=True,
+            header_style="bold yellow",
         )
-        print(
-            f"{'Partition Type':<25} | {format_offset(base + 4):<8} | {hex(p_type_id)} ({type_name})"
-        )
+        part_table.add_column("Field", width=25)
+        part_table.add_column("Offset", width=8)
+        part_table.add_column("Value")
 
-        print(
-            f"{'[LBA] Relative Sector':<25} | {format_offset(base + 8):<8} | {lba_start}"
+        part_table.add_row(
+            "Boot Flag",
+            hex(base),
+            f"{hex(p[0])} ({'Bootable' if p[0] == 0x80 else 'No'})",
         )
-        print(
-            f"{'[LBA] Total Sectors':<25} | {format_offset(base + 12):<8} | {lba_total}"
-        )
-
-        print(f"{'[CHS Start] Head':<25} | {format_offset(base + 1):<8} | {start_h}")
-        print(
-            f"{'[CHS Start] Cyl/Sec':<25} | {format_offset(base + 2):<8} | C:{start_c} S:{start_s}"
+        part_table.add_row(
+            "Partition Type", hex(base + 4), f"{hex(p_type_id)} ({type_name})"
         )
 
-        print(f"{'[CHS End] Head':<25} | {format_offset(base + 5):<8} | {end_h}")
-        print(
-            f"{'[CHS End] Cyl/Sec':<25} | {format_offset(base + 6):<8} | C:{end_c} S:{end_s}"
+        part_table.add_row("[LBA] Relative Sector", hex(base + 8), str(lba_start))
+        part_table.add_row("[LBA] Total Sectors", hex(base + 12), str(lba_total))
+        part_table.add_row("[CHS Start] Head", hex(base + 1), str(start_h))
+        part_table.add_row(
+            "[CHS Start] Cyl/Sec", hex(base + 2), f"C:{start_c} S:{start_s}"
         )
-        print("\n")
+        part_table.add_row("[CHS End] Head", hex(base + 5), hex(end_h))
+        part_table.add_row("[CHS End] Cyl/Sec", hex(base + 6), f"C:{end_c} S:{end_s}")
+
+        parts.append(
+            Panel(
+                part_table,
+                title=f"[bold yellow]Partition #{i + 1} [{mode} Mode][/bold yellow]",
+                subtitle=f"Offset: {hex(base)}",
+                border_style="yellow",
+            )
+        )
+
+    console.print(
+        Panel(
+            Group(*parts),
+            expand=False,
+            title="[bold cyan]Partition Table Entries[/bold cyan]",
+            border_style="bright_blue",
+        )
+    )
