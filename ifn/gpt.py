@@ -3,6 +3,12 @@ from typing import Annotated
 from pathlib import Path
 import struct
 import uuid
+from .utils import console
+from rich.console import Group, RenderableType
+from rich.table import Table
+from rich.rule import Rule
+from rich.panel import Panel
+
 
 gpt_app = typer.Typer(help="GPT specific tools")
 
@@ -63,28 +69,38 @@ def gpt_analyze(file: Annotated[Path, typer.Argument(exists=True)]):
     header = parse_gpt_header(header_data)
 
     if not header:
-        typer.secho("Valid GPT Header not found at LBA 1", fg="red", bold=True)
+        console.print("[bold red]Valid GPT Header not found at LBA 1[/bold red]")
         return
 
     # --- Print Header Information ---
-    typer.secho("\n=== GPT Header (LBA 1) ===", fg="cyan", bold=True)
-    print(f"{'Field':<25} | {'Offset':<8} | {'Value'}")
-    print("-" * 55)
-    print(f"{'Signature':<25} | 0x200    | EFI PART")
-    print(f"{'Disk GUID':<25} | 0x238    | {header['disk_guid']}")  # Added Disk GUID
-    print(f"{'Current LBA':<25} | 0x218    | {header['current_lba']}")
-    print(f"{'First Usable LBA':<25} | 0x228    | {header['first_usable']}")
-    print(f"{'Last Usable LBA':<25} | 0x230    | {header['last_usable']}")
-    print(f"{'Number of Entries':<25} | 0x250    | {header['num_entries']}")
-    print(f"{'Entry Size':<25} | 0x254    | {header['entry_size']} bytes")
-    print("\n")
+    header_table = Table(show_header=True)
+    header_table.add_column("Field", style="magenta")
+    header_table.add_column("Offset", justify="center")
+    header_table.add_column("Value", style="green")
+
+    header_table.add_row("Signature", "0x200", "EFI PART")
+    header_table.add_row("Current LBA", "0x218", str(header["current_lba"]))
+    header_table.add_row("First Usable LBA", "0x228", str(header["first_usable"]))
+    header_table.add_row("Last Usable LBA", "0x230", str(header["last_usable"]))
+    header_table.add_row("Disk GUID", "0x238", str(header["disk_guid"]))
+    header_table.add_row("Number of Entries", "0x250", str(header["num_entries"]))
+    header_table.add_row("Entry Size", "0x254", f"{header['entry_size']} bytes")
+
+    console.print(
+        Panel(
+            header_table,
+            title="[bold cyan]GPT Header (LBA 1)[/bold cyan]",
+            border_style="bright_blue",
+            expand=False,
+        )
+    )
 
     # --- Print Partition Table Entries ---
-    typer.secho("=== Partition Table Entries ===", fg="cyan", bold=True)
 
     # Partition entries start at LBA 2 (Offset 1024)
     start_offset = 1024
-    found_any = False
+
+    parts: list[RenderableType] = []
 
     for i in range(header["num_entries"]):
         entry_offset = start_offset + (i * header["entry_size"])
@@ -97,39 +113,52 @@ def gpt_analyze(file: Annotated[Path, typer.Argument(exists=True)]):
         part = parse_gpt_partition(entry_data)
 
         if part:
-            found_any = True
-            typer.secho(
-                f"\nPartition #{i} at offset {hex(entry_offset)}",
-                fg="yellow",
-                bold=True,
+            # Create a table for each partition
+            part_table = Table(
+                box=None,
+                show_header=True,
+                header_style="bold yellow",
             )
-            print(f"{'Field':<25} | {'Offset':<8} | {'Value'}")
-            print("-" * 75)
+            part_table.add_column("Field", width=25)
+            part_table.add_column("Offset", width=10)
+            part_table.add_column("Value")
 
-            # Name logic
-            name_val = part["name"] if part["name"] else "[No Name]"
-
-            print(
-                f"{'Partition Name':<25} | {hex(entry_offset + 0x38):<8} | {name_val}"
-            )
-            print(f"{'Type GUID':<25} | {hex(entry_offset + 0x00):<8} | {part['type']}")
-            print(
-                f"{'Unique GUID':<25} | {hex(entry_offset + 0x10):<8} | {part['uuid']}"
-            )
-            print(
-                f"{'First LBA':<25} | {hex(entry_offset + 0x20):<8} | {part['first_lba']}"
-            )
-            print(
-                f"{'Last LBA':<25} | {hex(entry_offset + 0x28):<8} | {part['last_lba']}"
-            )
-            print(
-                f"{'Total Sectors':<25} | {hex(entry_offset + 0x28):<8} | {part['size_sectors']}"
-            )
-
-            # Human readable size (not a direct disk value, but useful)
             size_mib = (part["size_sectors"] * 512) / 1024 / 1024
-            print(f"{'Calculated Size':<25} | {'N/A':<8} | {size_mib:.2f} MiB")
-            print("-" * 75)
 
-    if not found_any:
-        typer.echo("No active partitions found in the table.")
+            part_table.add_row(
+                "Partition Name",
+                hex(entry_offset + 0x38),
+                part["name"] or "[No Name]",
+            )
+            part_table.add_row("Type GUID", hex(entry_offset), str(part["type"]))
+            part_table.add_row(
+                "Unique GUID", hex(entry_offset + 0x10), str(part["uuid"])
+            )
+            part_table.add_row("First LBA", hex(0x4A0), str(part["first_lba"]))
+            part_table.add_row("Last LBA", hex(0x4A8), str(part["last_lba"]))
+            part_table.add_row("Total sectors", "", str(part["size_sectors"]))
+            part_table.add_row(
+                "Calculated Size", "", f"[bold green]{size_mib:.2f} MiB[/bold green]"
+            )
+
+            # Using a Panel to wrap each partition makes the terminal look like a real UI
+            parts.append(
+                Panel(
+                    part_table,
+                    title=f"[bold yellow]Partition #{i}[/bold yellow]",
+                    subtitle=f"Offset: {hex(entry_offset)}",
+                    border_style="yellow",
+                )
+            )
+
+    if len(parts):
+        console.print(
+            Panel(
+                Group(*parts),
+                expand=False,
+                title="[bold cyan]Partition Table Entries[/bold cyan]",
+                border_style="bright_blue",
+            )
+        )
+    else:
+        console.print("[bold red]No active partitions found in the table.[/bold red]")
