@@ -78,6 +78,24 @@ def parse_mbr_id(data: bytes):
     return disk_id[::-1].hex().upper()
 
 
+def format_size(sectors: int) -> str:
+    """Converts sectors to a human readable string (assuming 512b sectors)."""
+    bytes_size = sectors * 512
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if bytes_size < 1024:
+            return f"{bytes_size:.2f} {unit}"
+        bytes_size /= 1024
+    return f"{bytes_size:.2f} PB"
+
+
+def chs_to_lba(c, h, s, hpc=255, spt=63):
+    """
+    Converts CHS to a relative sector count.
+    Default geometry is usually 255 heads, 63 sectors.
+    """
+    return (c * hpc + h) * spt + (s - 1)
+
+
 @mbr_app.command("analyze")
 def analyze(
     file: Annotated[Path, typer.Argument(help="Path to the MBR dump", exists=True)],
@@ -139,6 +157,20 @@ def analyze(
         start_c, start_h, start_s = parse_chs(p[1:4])
         end_c, end_h, end_s = parse_chs(p[5:8])
 
+        # 2. CHS Size (Calculated)
+        # We calculate the absolute LBA for the start and end CHS addresses
+        chs_start_abs = chs_to_lba(start_c, start_h, start_s)
+        chs_end_abs = chs_to_lba(end_c, end_h, end_s)
+        # Total sectors according to CHS
+        chs_total_sectors = (chs_end_abs - chs_start_abs) + 1
+
+        # If CHS is 1023/254/63 (the max), it's likely a large disk
+        # and CHS size will be incorrect/capped.
+        if end_c >= 1023:
+            chs_size_str = "Legacy Cap (Size unreliable)"
+        else:
+            chs_size_str = format_size(chs_total_sectors)
+
         part_table = Table(
             box=None,
             show_header=True,
@@ -159,12 +191,14 @@ def analyze(
 
         part_table.add_row("[LBA] Relative Sector", hex(base + 8), str(lba_start))
         part_table.add_row("[LBA] Total Sectors", hex(base + 12), str(lba_total))
+        part_table.add_row("[LBA] Size", "", format_size(lba_total))
         part_table.add_row("[CHS Start] Head", hex(base + 1), str(start_h))
         part_table.add_row(
             "[CHS Start] Cyl/Sec", hex(base + 2), f"C:{start_c} S:{start_s}"
         )
         part_table.add_row("[CHS End] Head", hex(base + 5), hex(end_h))
         part_table.add_row("[CHS End] Cyl/Sec", hex(base + 6), f"C:{end_c} S:{end_s}")
+        part_table.add_row("[CHS] Size", "", chs_size_str)
 
         parts.append(
             Panel(
