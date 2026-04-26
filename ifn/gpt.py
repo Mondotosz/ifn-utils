@@ -3,10 +3,11 @@ from typing import Annotated
 from pathlib import Path
 import struct
 import uuid
-from .utils import console
+from .utils import console, format_size
 from rich.console import Group, RenderableType
 from rich.table import Table
 from rich.panel import Panel
+from enum import Enum
 
 
 gpt_app = typer.Typer(help="GPT specific tools")
@@ -126,8 +127,6 @@ def gpt_analyze(file: Annotated[Path, typer.Argument(exists=True)]):
             part_table.add_column("Offset", width=10)
             part_table.add_column("Value")
 
-            size_mib = (part["size_sectors"] * 512) / 1024 / 1024
-
             part_table.add_row(
                 "Partition Name",
                 hex(entry_offset + 0x38),
@@ -141,7 +140,9 @@ def gpt_analyze(file: Annotated[Path, typer.Argument(exists=True)]):
             part_table.add_row("Last LBA", hex(0x4A8), str(part["last_lba"]))
             part_table.add_row("Total sectors", "", str(part["size_sectors"]))
             part_table.add_row(
-                "Calculated Size", "", f"[bold green]{size_mib:.2f} MiB[/bold green]"
+                "Calculated Size",
+                "",
+                f"[bold green]{format_size(part['size_sectors'])} MiB[/bold green]",
             )
 
             # Using a Panel to wrap each partition makes the terminal look like a real UI
@@ -165,3 +166,42 @@ def gpt_analyze(file: Annotated[Path, typer.Argument(exists=True)]):
         )
     else:
         console.print("[bold red]No active partitions found in the table.[/bold red]")
+
+
+class Endianness(str, Enum):
+    little = "little"
+    big = "big"
+
+
+@gpt_app.command("guid")
+def parse_guid(
+    data: Annotated[str, typer.Argument(help="16 Bytes hex string to parse")],
+    endian: Annotated[Endianness, typer.Option(help="Endianness")] = Endianness.little,
+):
+    # Convert hex string to bytes
+    try:
+        clean_hex = data.replace(" ", "").replace("0x", "")
+        raw_bytes = bytes.fromhex(clean_hex)
+        if len(raw_bytes) != 16:
+            raise ValueError("Data must be exactly 16 bytes (32 hex characters).")
+    except ValueError as e:
+        typer.echo(f"Error: {e}")
+        raise typer.Exit(code=1)
+
+    # Define the format string based on endianness
+    # < is little-endian, > is big-endian
+    fmt = "<16s" if endian == Endianness.little else ">16s"
+
+    # Unpack the bytes
+    unpacked = struct.unpack(fmt, raw_bytes)[0]
+
+    # Create the UUID object
+    # Note: uuid.UUID(bytes_le=...) specifically handles the mixed-endian
+    # format often used in Windows GUIDs.
+    # If the input is a pure byte swap, we use bytes=...
+    if endian == Endianness.little:
+        parsed_uuid = uuid.UUID(bytes_le=unpacked)
+    else:
+        parsed_uuid = uuid.UUID(bytes=unpacked)
+
+    typer.echo(f"Parsed GUID ({endian.value} endian): {parsed_uuid}")

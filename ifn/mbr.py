@@ -2,7 +2,7 @@ import typer
 from typing import Annotated
 from pathlib import Path
 import struct
-from .utils import console
+from .utils import console, format_size
 from rich.console import Group, RenderableType
 from rich.table import Table
 from rich.panel import Panel
@@ -76,16 +76,6 @@ def parse_mbr_id(data: bytes):
     # Located at offset 440 (0x1B8), 4 bytes long
     disk_id = data[440:444]
     return disk_id[::-1].hex().upper()
-
-
-def format_size(sectors: int) -> str:
-    """Converts sectors to a human readable string (assuming 512b sectors)."""
-    bytes_size = sectors * 512
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if bytes_size < 1024:
-            return f"{bytes_size:.2f} {unit}"
-        bytes_size /= 1024
-    return f"{bytes_size:.2f} PB"
 
 
 def chs_to_lba(c, h, s, hpc=255, spt=63):
