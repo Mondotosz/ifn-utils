@@ -171,3 +171,13 @@ def get(
         title="Registry Value",
         border_style="green",
     ))
+
+
+# Register per-hive sub-apps at the bottom to avoid circular imports
+from ifn.cli.hives import sam, software, system, ntuser, security  # noqa: E402
+
+app.add_typer(sam.app,      name="sam")
+app.add_typer(software.app, name="software")
+app.add_typer(system.app,   name="system")
+app.add_typer(ntuser.app,   name="ntuser")
+app.add_typer(security.app, name="security")
