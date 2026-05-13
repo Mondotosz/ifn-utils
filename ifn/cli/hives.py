@@ -5,6 +5,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
+from rich.tree import Tree
 from rich import box
 from Registry import Registry
 
@@ -37,6 +38,38 @@ def _key_path(reg: Registry.Registry, path: str | None) -> Registry.RegistryKey:
     except Registry.RegistryKeyNotFoundException:
         console.print(f"[red]Key not found: {path!r}[/red]")
         raise typer.Exit(1)
+
+
+def _build_tree(node: Tree, key: Registry.RegistryKey, current_depth: int, max_depth: int) -> None:
+    if current_depth >= max_depth:
+        remaining = len(list(key.subkeys()))
+        if remaining:
+            node.add(f"[dim]… {remaining} subkey{'s' if remaining != 1 else ''} (increase --depth to expand)[/dim]")
+        return
+    for subkey in key.subkeys():
+        label = f"[cyan]{subkey.name()}[/cyan]  [dim]{_fmt_ts(subkey.timestamp())}[/dim]"
+        child = node.add(label)
+        _build_tree(child, subkey, current_depth + 1, max_depth)
+
+
+@app.command()
+def tree(
+    hive: Path = typer.Argument(..., help="Path to hive file", exists=True),
+    path: Optional[str] = typer.Argument(None, help="Registry key path to start from (default: root)"),
+    depth: int = typer.Option(2, "--depth", "-d", help="Maximum depth to expand"),
+):
+    """Show a tree view of registry subkeys up to a given depth."""
+    reg = _open_hive(hive)
+    key = _key_path(reg, path)
+
+    display_path = path or key.name()
+    root_label = (
+        f"[bold cyan]{display_path}[/bold cyan]"
+        f"  [dim]{_fmt_ts(key.timestamp())}[/dim]"
+    )
+    t = Tree(root_label)
+    _build_tree(t, key, 0, depth)
+    console.print(t)
 
 
 @app.command()
