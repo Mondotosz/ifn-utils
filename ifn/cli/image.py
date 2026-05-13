@@ -3,12 +3,16 @@ from typing import Optional
 import re
 import subprocess
 import sys
+import tempfile
 
 import typer
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
+
+from ifn.parsers import recycle as _recycle_parser
+from ifn.parsers.sam import parse_v_blob, extract_user_sid
 
 app = typer.Typer(help="Work with EWF/E01 disk images")
 console = Console()
@@ -228,3 +232,176 @@ def dump(
         console.print("[red]ewfacquire failed.[/red]")
         raise typer.Exit(1)
     console.print(f"[green]Acquisition complete: {output}.E01[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Recycle Bin helpers
+# ---------------------------------------------------------------------------
+
+def _auto_detect_offset(image: Path) -> int:
+    """Find the Windows NTFS partition offset via mmls (largest Basic data partition)."""
+    result = _run(["mmls", str(image)], check=False)
+    best_start: int | None = None
+    best_len = 0
+    for line in result.stdout.splitlines():
+        m = re.match(r"\d{3}:\s+\S+\s+(\d+)\s+\d+\s+(\d+)\s*(.*)", line)
+        if m:
+            start, length, desc = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+            if "basic data" in desc.lower() and length > best_len:
+                best_start, best_len = start, length
+    if best_start is None:
+        console.print("[red]Could not auto-detect Windows partition. Use --offset.[/red]")
+        raise typer.Exit(1)
+    return best_start
+
+
+def _fls_list(offset: int, image: Path, inode: str | None = None) -> list[tuple[str, str, str]]:
+    """Run fls and return list of (entry_type, inode_spec, name) tuples."""
+    cmd = ["fls", "-o", str(offset), str(image)]
+    if inode:
+        cmd.append(inode)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    entries = []
+    for line in result.stdout.splitlines():
+        m = re.match(r"([rd]/[rd])\s+(\S+):\t(.+)", line)
+        if m:
+            entries.append((m.group(1), m.group(2), m.group(3).strip()))
+    return entries
+
+
+def _find_child(offset: int, image: Path, parent: str | None, name: str) -> str | None:
+    """Return the inode spec of a named child entry (case-insensitive)."""
+    for _, inode, fname in _fls_list(offset, image, parent):
+        if fname.lower() == name.lower():
+            return inode
+    return None
+
+
+_WELL_KNOWN_SIDS: dict[str, str] = {
+    "S-1-5-18": "SYSTEM",
+    "S-1-5-19": "LOCAL SERVICE",
+    "S-1-5-20": "NETWORK SERVICE",
+}
+
+
+def _build_sid_map(sam_path: Path) -> dict[str, str]:
+    """Return {full_sid_string: username} from a SAM hive file."""
+    from Registry import Registry
+
+    sid_map = dict(_WELL_KNOWN_SIDS)
+    try:
+        reg = Registry.Registry(str(sam_path))
+        users_key = reg.open("SAM\\Domains\\Account\\Users")
+        entries: list[tuple[int, bytes]] = []
+        for subkey in users_key.subkeys():
+            if subkey.name() == "Names":
+                continue
+            try:
+                rid = int(subkey.name(), 16)
+                v_data = subkey.value("V").value()
+                entries.append((rid, v_data))
+            except Exception:
+                pass
+        domain_sid: str | None = None
+        for rid, v_data in entries:
+            sid = extract_user_sid(v_data, rid)
+            if sid:
+                domain_sid = sid.rsplit("-", 1)[0]
+                break
+        for rid, v_data in entries:
+            v = parse_v_blob(v_data)
+            sid = extract_user_sid(v_data, rid) or (f"{domain_sid}-{rid}" if domain_sid else None)
+            if sid and v["username"]:
+                sid_map[sid] = v["username"]
+    except Exception as e:
+        console.print(f"[yellow]Warning: SAM parse error: {e}[/yellow]")
+    return sid_map
+
+
+# ---------------------------------------------------------------------------
+# recycle command
+# ---------------------------------------------------------------------------
+
+@app.command()
+def recycle(
+    file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
+    offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start sector (auto-detected if omitted)"),
+    sam: Optional[Path] = typer.Option(None, "--sam", "-s", help="Local SAM hive to resolve SIDs to usernames"),
+    auto_sam: bool = typer.Option(False, "--auto-sam", "-a", help="Auto-extract SAM from the image to resolve SIDs"),
+):
+    """Analyze all $Recycle.Bin entries from a disk image."""
+    if offset is None:
+        offset = _auto_detect_offset(file)
+        console.print(f"[dim]Auto-detected Windows partition at sector {offset}[/dim]")
+
+    # Find $Recycle.Bin inode
+    rb_inode = _find_child(offset, file, None, "$Recycle.Bin")
+    if not rb_inode:
+        console.print("[red]$Recycle.Bin not found in partition root.[/red]")
+        raise typer.Exit(1)
+
+    # Build SID→username map
+    sid_map: dict[str, str] = {}
+    if sam:
+        sid_map = _build_sid_map(sam)
+        console.print(f"[dim]SAM loaded from {sam} — {len(sid_map)} SID entries[/dim]")
+    elif auto_sam:
+        sam_inode = _find_child(offset, file, None, "Windows")
+        for step in ["System32", "config", "SAM"]:
+            if sam_inode is None:
+                break
+            sam_inode = _find_child(offset, file, sam_inode, step)
+        if sam_inode:
+            with tempfile.NamedTemporaryFile(suffix=".SAM", delete=False) as tmp:
+                tmp_path = Path(tmp.name)
+            try:
+                r = subprocess.run(["icat", "-o", str(offset), str(file), sam_inode],
+                                   capture_output=True)
+                tmp_path.write_bytes(r.stdout)
+                sid_map = _build_sid_map(tmp_path)
+                console.print(f"[dim]Auto-extracted SAM ({len(r.stdout):,} bytes) — {len(sid_map)} SID entries[/dim]")
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        else:
+            console.print("[yellow]Warning: SAM not found on image — SIDs will not be resolved.[/yellow]")
+
+    # Enumerate SID subdirectories and their $I files
+    table = Table(title=f"$Recycle.Bin — {file.name}", box=box.ROUNDED, header_style="bold")
+    if sid_map:
+        table.add_column("User")
+    table.add_column("SID")
+    table.add_column("$I file")
+    table.add_column("Deleted at")
+    table.add_column("Orig. size", justify="right")
+    table.add_column("Original path")
+
+    for _, sid_inode, sid_name in _fls_list(offset, file, rb_inode):
+        username = sid_map.get(sid_name) or _WELL_KNOWN_SIDS.get(sid_name)
+        for _, file_inode, fname in _fls_list(offset, file, sid_inode):
+            # Only $I index files; skip ADS entries (contain ":")
+            if not fname.startswith("$I") or ":" in fname:
+                continue
+            r = subprocess.run(["icat", "-o", str(offset), str(file), file_inode],
+                                capture_output=True)
+            if r.returncode != 0:
+                continue
+            try:
+                rec = _recycle_parser.parse_i_file(r.stdout)
+                deleted_str = rec.deleted_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+                size_str = f"{rec.file_size:,}"
+                path_str = rec.original_path
+            except Exception as e:
+                deleted_str = "[red]parse error[/red]"
+                size_str = "?"
+                path_str = str(e)
+
+            row: list[str] = []
+            if sid_map:
+                row.append(username or "[dim]—[/dim]")
+            row += [sid_name, fname, deleted_str, size_str, path_str]
+            table.add_row(*row)
+
+    if table.row_count == 0:
+        console.print("[dim]No $Recycle.Bin entries found.[/dim]")
+    else:
+        console.print(table)
