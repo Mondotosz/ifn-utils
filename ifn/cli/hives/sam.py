@@ -49,7 +49,9 @@ def _open_hive(path: Path) -> Registry.Registry:
         raise typer.Exit(1)
 
 
-def _fmt_ts(dt) -> str:
+def _fmt_ts(dt, pw_must_change: bool = False) -> str:
+    if pw_must_change:
+        return "[yellow]Must change at next logon[/yellow]"
     if dt is None:
         return "Never"
     if isinstance(dt, str):
@@ -131,7 +133,7 @@ def users(hive: Path = typer.Argument(..., help="Path to SAM hive", exists=True)
             v["username"] or f"[dim]{rid}[/dim]",
             flags_str,
             _fmt_ts(f["last_logon"]),
-            _fmt_ts(f["last_pw_change"]),
+            _fmt_ts(f["last_pw_change"], pw_must_change=f["pw_must_change"]),
             _fmt_ts(f["account_expires"]),
             str(f["logon_count"]),
             str(f["failed_count"]),

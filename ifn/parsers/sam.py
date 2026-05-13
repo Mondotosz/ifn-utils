@@ -4,18 +4,31 @@ from ifn.parsers.windows_time import filetime_to_datetime
 
 BASE = 0xCC  # V blob: field data section starts at this offset
 
+# MS-SAMR Section 2.2.1.12 USER_ACCOUNT Codes
+# Binary F blob field: uint32 at offset 0x38 (56).
 ACCOUNT_FLAGS = {
-    0x0001: "Disabled",
-    0x0002: "Home dir required",
-    0x0004: "Password not required",
-    0x0008: "Temp duplicate account",
-    0x0010: "Normal user account",
-    0x0020: "MNS logon account",
-    0x0040: "Interdomain trust account",
-    0x0080: "Workstation trust account",
-    0x0100: "Server trust account",
-    0x0200: "Password never expires",
-    0x0400: "Auto-locked",
+    0x00000001: "Account disabled",
+    0x00000002: "Home directory required",
+    0x00000004: "Password not required",
+    0x00000008: "Temp duplicate account",
+    0x00000010: "Normal account",
+    0x00000020: "MNS logon account",
+    0x00000040: "Interdomain trust account",
+    0x00000080: "Workstation trust account",
+    0x00000100: "Server trust account",
+    0x00000200: "Password never expires",
+    0x00000400: "Account auto-locked",
+    0x00000800: "Encrypted text password allowed",
+    0x00001000: "Smartcard required",
+    0x00002000: "Trusted for delegation",
+    0x00004000: "Not delegated",
+    0x00008000: "Use DES key only",
+    0x00010000: "Don't require preauth",
+    0x00020000: "Password expired",
+    0x00040000: "Trusted to auth for delegation",
+    0x00080000: "No auth data required",
+    0x00100000: "Partial secrets account",
+    0x00200000: "Use AES keys",
 }
 
 
@@ -88,26 +101,36 @@ def parse_v_blob(data: bytes) -> dict:
 def parse_f_blob(data: bytes) -> dict:
     """Extract account metadata from a SAM F blob.
 
-    Returns: rid, account_flags, last_logon, last_pw_change, account_expires,
-             last_failed_logon (datetime | None | "never expires"), failed_count, logon_count.
+    F blob layout (verified against Windows 10/11 SAM):
+      0x00 uint16  Revision
+      0x08 uint64  LastLogon (FILETIME)
+      0x18 uint64  LastPwChange (FILETIME; 0 = must change at next logon)
+      0x20 uint64  AccountExpires (FILETIME; 0x7FFFFFFFFFFFFFFF = never)
+      0x28 uint64  LastFailedLogon (FILETIME)
+      0x30 uint32  RID
+      0x38 uint32  AccountFlags (USER_ACCOUNT Codes, MS-SAMR 2.2.1.12)
+      0x40 uint16  FailedLogonCount
+      0x42 uint16  LogonCount
     """
-    if len(data) < 72:
-        raise ValueError(f"F blob too short: {len(data)} bytes (expected ≥72)")
+    if len(data) < 0x44:
+        raise ValueError(f"F blob too short: {len(data)} bytes (expected ≥0x44)")
 
     def _ft(ticks: int):
-        if ticks == 0:
-            return None
         if ticks == 0x7FFFFFFFFFFFFFFF:
             return "never expires"
+        if ticks == 0:
+            return None
         return filetime_to_datetime(ticks)
 
+    last_pw_change_ticks = struct.unpack_from("<Q", data, 0x18)[0]
     return {
-        "rid":               struct.unpack_from("<I", data, 48)[0],
-        "account_flags":     struct.unpack_from("<H", data, 52)[0],
-        "last_logon":        _ft(struct.unpack_from("<Q", data, 8)[0]),
-        "last_pw_change":    _ft(struct.unpack_from("<Q", data, 24)[0]),
-        "account_expires":   _ft(struct.unpack_from("<Q", data, 32)[0]),
-        "last_failed_logon": _ft(struct.unpack_from("<Q", data, 40)[0]),
-        "failed_count":      struct.unpack_from("<H", data, 64)[0],
-        "logon_count":       struct.unpack_from("<H", data, 66)[0],
+        "rid":               struct.unpack_from("<I", data, 0x30)[0],
+        "account_flags":     struct.unpack_from("<I", data, 0x38)[0],
+        "last_logon":        _ft(struct.unpack_from("<Q", data, 0x08)[0]),
+        "last_pw_change":    _ft(last_pw_change_ticks),
+        "pw_must_change":    last_pw_change_ticks == 0,
+        "account_expires":   _ft(struct.unpack_from("<Q", data, 0x20)[0]),
+        "last_failed_logon": _ft(struct.unpack_from("<Q", data, 0x28)[0]),
+        "failed_count":      struct.unpack_from("<H", data, 0x40)[0],
+        "logon_count":       struct.unpack_from("<H", data, 0x42)[0],
     }

@@ -8,24 +8,11 @@ from rich.panel import Panel
 from rich import box
 
 from ifn.parsers.windows_time import filetime_to_datetime
+from ifn.parsers.sam import ACCOUNT_FLAGS as _ACCOUNT_FLAGS
 from ifn.display.hex_table import render_hex_table
 
 app = typer.Typer(help="Parse SAM hive F and V value blobs")
 console = Console()
-
-_ACCOUNT_FLAGS = {
-    0x0001: "Account disabled",
-    0x0002: "Home directory required",
-    0x0004: "Password not required",
-    0x0008: "Temporary duplicate account",
-    0x0010: "Normal user account",
-    0x0020: "MNS logon account",
-    0x0040: "Interdomain trust account",
-    0x0080: "Workstation trust account",
-    0x0100: "Server trust account",
-    0x0200: "Password does not expire",
-    0x0400: "Account auto-locked",
-}
 
 
 @app.command(name="v-blob")
@@ -119,45 +106,47 @@ def f_blob(file: Path = typer.Argument(..., help="Path to F blob binary", exists
         console.print(f"[red]F blob too short: {len(data)} bytes (expected ≥72)[/red]")
         raise typer.Exit(1)
 
-    revision = struct.unpack_from("<H", data, 0)[0]
-    last_logon_ft = struct.unpack_from("<Q", data, 8)[0]
-    last_pw_change_ft = struct.unpack_from("<Q", data, 24)[0]
-    account_expires_ft = struct.unpack_from("<Q", data, 32)[0]
-    last_failed_ft = struct.unpack_from("<Q", data, 40)[0]
-    rid = struct.unpack_from("<I", data, 48)[0]
-    acct_flags = struct.unpack_from("<H", data, 52)[0]
-    failed_count = struct.unpack_from("<H", data, 64)[0]
-    logon_count = struct.unpack_from("<H", data, 66)[0]
+    revision = struct.unpack_from("<H", data, 0x00)[0]
+    last_logon_ft      = struct.unpack_from("<Q", data, 0x08)[0]
+    last_pw_change_ft  = struct.unpack_from("<Q", data, 0x18)[0]
+    account_expires_ft = struct.unpack_from("<Q", data, 0x20)[0]
+    last_failed_ft     = struct.unpack_from("<Q", data, 0x28)[0]
+    rid                = struct.unpack_from("<I", data, 0x30)[0]
+    acct_flags         = struct.unpack_from("<I", data, 0x38)[0]
+    failed_count       = struct.unpack_from("<H", data, 0x40)[0]
+    logon_count        = struct.unpack_from("<H", data, 0x42)[0]
 
     def ft(ticks: int) -> str:
-        if ticks == 0:
-            return "Never"
         if ticks == 0x7FFFFFFFFFFFFFFF:
             return "Never expires"
+        if ticks == 0:
+            return "Never"
         return filetime_to_datetime(ticks).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     flag_names = [name for bit, name in _ACCOUNT_FLAGS.items() if acct_flags & bit]
+    pw_must_change = last_pw_change_ft == 0
 
     hex_fields: list[tuple[int, int, str, str]] = [
-        (0,  2,  "Revision",         str(revision)),
-        (8,  8,  "Last logon",       ft(last_logon_ft)),
-        (24, 8,  "Last PW change",   ft(last_pw_change_ft)),
-        (32, 8,  "Account expires",  ft(account_expires_ft)),
-        (40, 8,  "Last failed logon",ft(last_failed_ft)),
-        (48, 4,  "RID",              str(rid)),
-        (52, 2,  "Account flags",    f"0x{acct_flags:04X}"),
-        (64, 2,  "Failed count",     str(failed_count)),
-        (66, 2,  "Logon count",      str(logon_count)),
+        (0x00, 2, "Revision",          str(revision)),
+        (0x08, 8, "Last logon",        ft(last_logon_ft)),
+        (0x18, 8, "Last PW change",    ft(last_pw_change_ft)),
+        (0x20, 8, "Account expires",   ft(account_expires_ft)),
+        (0x28, 8, "Last failed logon", ft(last_failed_ft)),
+        (0x30, 4, "RID",               str(rid)),
+        (0x38, 4, "Account flags",     f"0x{acct_flags:08X}"),
+        (0x40, 2, "Failed count",      str(failed_count)),
+        (0x42, 2, "Logon count",       str(logon_count)),
     ]
-    render_hex_table(data[:72], hex_fields, title=f"SAM F Blob — {file.name}")
+    render_hex_table(data[:0x44], hex_fields, title=f"SAM F Blob — {file.name}")
 
+    pw_change_str = "Must change at next logon" if pw_must_change else ft(last_pw_change_ft)
     console.print(Panel(
-        f"[bold]RID:[/bold]              {rid}\n"
-        f"[bold]Account flags:[/bold]    0x{acct_flags:04X}  ({', '.join(flag_names) or 'None'})\n"
-        f"[bold]Last logon:[/bold]       {ft(last_logon_ft)}\n"
-        f"[bold]Last PW change:[/bold]   {ft(last_pw_change_ft)}\n"
-        f"[bold]Account expires:[/bold]  {ft(account_expires_ft)}\n"
-        f"[bold]Last failed logon:[/bold]{ft(last_failed_ft)}\n"
+        f"[bold]RID:[/bold]               {rid}\n"
+        f"[bold]Account flags:[/bold]     0x{acct_flags:08X}  ({', '.join(flag_names) or 'None'})\n"
+        f"[bold]Last logon:[/bold]        {ft(last_logon_ft)}\n"
+        f"[bold]Last PW change:[/bold]    {pw_change_str}\n"
+        f"[bold]Account expires:[/bold]   {ft(account_expires_ft)}\n"
+        f"[bold]Last failed logon:[/bold] {ft(last_failed_ft)}\n"
         f"[bold]Failed logon count:[/bold]{failed_count}\n"
         f"[bold]Total logon count:[/bold] {logon_count}",
         title="Decoded",

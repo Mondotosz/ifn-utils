@@ -90,9 +90,6 @@ def info(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=T
         ("CurrentBuildNumber",         _val(key, "CurrentBuildNumber")),
         ("BaseBuildRevisionNumber",    _val(key, "BaseBuildRevisionNumber")),
         ("UBR",                        _val(key, "UBR")),
-        ("CSDVersion",                 _val(key, "CSDVersion")),
-        ("CSDReleaseType",             _val(key, "CSDReleaseType")),
-        ("CSDBuildNumber",             _val(key, "CSDBuildNumber")),
         # Build info
         ("BuildBranch",                _val(key, "BuildBranch")),
         ("BuildLab",                   _val(key, "BuildLab")),
