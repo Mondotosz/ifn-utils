@@ -1,4 +1,4 @@
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Optional
 import re
 import subprocess
@@ -328,6 +328,7 @@ def recycle(
     offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start sector (auto-detected if omitted)"),
     sam: Optional[Path] = typer.Option(None, "--sam", "-s", help="Local SAM hive to resolve SIDs to usernames"),
     auto_sam: bool = typer.Option(False, "--auto-sam", "-a", help="Auto-extract SAM from the image to resolve SIDs"),
+    extract: Optional[Path] = typer.Option(None, "--extract", "-e", help="Extract $R files to this directory"),
 ):
     """Analyze all $Recycle.Bin entries from a disk image."""
     if offset is None:
@@ -365,7 +366,10 @@ def recycle(
         else:
             console.print("[yellow]Warning: SAM not found on image — SIDs will not be resolved.[/yellow]")
 
-    # Enumerate SID subdirectories and their $I files
+    if extract is not None:
+        extract.mkdir(parents=True, exist_ok=True)
+
+    # Enumerate SID subdirectories and their $I/$R file pairs
     table = Table(title=f"$Recycle.Bin — {file.name}", box=box.ROUNDED, header_style="bold")
     if sid_map:
         table.add_column("User")
@@ -377,14 +381,27 @@ def recycle(
 
     for _, sid_inode, sid_name in _fls_list(offset, file, rb_inode):
         username = sid_map.get(sid_name) or _WELL_KNOWN_SIDS.get(sid_name)
-        for _, file_inode, fname in _fls_list(offset, file, sid_inode):
-            # Only $I index files; skip ADS entries (contain ":")
-            if not fname.startswith("$I") or ":" in fname:
+
+        # Build $R suffix→inode map and collect $I entries in one fls call
+        dir_entries = _fls_list(offset, file, sid_inode)
+        r_map: dict[str, str] = {
+            fname[2:]: inode
+            for _, inode, fname in dir_entries
+            if fname.startswith("$R") and ":" not in fname
+        }
+
+        # Prepare per-SID extract directory (created lazily on first file)
+        sid_extract_dir: Path | None = None
+
+        for _, i_inode, i_fname in dir_entries:
+            if not i_fname.startswith("$I") or ":" in i_fname:
                 continue
-            r = subprocess.run(["icat", "-o", str(offset), str(file), file_inode],
+
+            r = subprocess.run(["icat", "-o", str(offset), str(file), i_inode],
                                 capture_output=True)
             if r.returncode != 0:
                 continue
+
             try:
                 rec = _recycle_parser.parse_i_file(r.stdout)
                 deleted_str = rec.deleted_at.strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -394,12 +411,49 @@ def recycle(
                 deleted_str = "[red]parse error[/red]"
                 size_str = "?"
                 path_str = str(e)
+                rec = None
 
             row: list[str] = []
             if sid_map:
                 row.append(username or "[dim]—[/dim]")
-            row += [sid_name, fname, deleted_str, size_str, path_str]
+            row += [sid_name, i_fname, deleted_str, size_str, path_str]
             table.add_row(*row)
+
+            # Extract $I and $R files if requested
+            if extract is not None and rec is not None:
+                suffix = i_fname[2:]  # e.g. "2UXVB4.jpg"
+                r_inode = r_map.get(suffix)
+
+                # Create per-user directory on first file
+                if sid_extract_dir is None:
+                    dir_name = username if username else sid_name
+                    sid_extract_dir = extract / dir_name
+                    sid_extract_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Write info.txt only when username is resolved from SAM
+                    if username and username not in _WELL_KNOWN_SIDS.values():
+                        info_txt = (
+                            f"SID:      {sid_name}\n"
+                            f"Username: {username}\n"
+                        )
+                        (sid_extract_dir / "info.txt").write_text(info_txt, encoding="utf-8")
+
+                # Extract the $I index file
+                (sid_extract_dir / i_fname).write_bytes(r.stdout)
+                console.print(f"[green]  Extracted {i_fname} → {sid_extract_dir / i_fname}[/green]")
+
+                # Extract the matching $R data file
+                if r_inode is None:
+                    console.print(f"[yellow]  No $R file found for {i_fname}[/yellow]")
+                else:
+                    r_fname = f"$R{suffix}"
+                    rdata = subprocess.run(["icat", "-o", str(offset), str(file), r_inode],
+                                           capture_output=True)
+                    if rdata.returncode == 0:
+                        (sid_extract_dir / r_fname).write_bytes(rdata.stdout)
+                        console.print(f"[green]  Extracted $R{suffix} → {sid_extract_dir / r_fname}[/green]")
+                    else:
+                        console.print(f"[red]  Failed to extract $R{suffix}[/red]")
 
     if table.row_count == 0:
         console.print("[dim]No $Recycle.Bin entries found.[/dim]")
