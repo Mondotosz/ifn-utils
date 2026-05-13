@@ -140,6 +140,7 @@ def get(
     hive: Path = typer.Argument(..., help="Path to hive file", exists=True),
     path: str = typer.Argument(..., help="Registry key path"),
     value: str = typer.Argument(..., help="Value name"),
+    dump: Optional[Path] = typer.Option(None, "--dump", "-d", help="Dump raw value bytes to this file"),
 ):
     """Print a single registry value with its type and data."""
     reg = _open_hive(hive)
@@ -171,6 +172,12 @@ def get(
         title="Registry Value",
         border_style="green",
     ))
+
+    if dump is not None:
+        if not isinstance(raw, bytes):
+            console.print(f"[yellow]Warning: value type is {vtype}, not REG_BINARY — dumping as-is may not be useful[/yellow]")
+        dump.write_bytes(raw if isinstance(raw, bytes) else str(raw).encode())
+        console.print(f"[green]Dumped {len(raw) if isinstance(raw, bytes) else len(str(raw))} bytes to {dump}[/green]")
 
 
 # Register per-hive sub-apps at the bottom to avoid circular imports
