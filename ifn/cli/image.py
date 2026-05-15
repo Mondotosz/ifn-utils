@@ -1,5 +1,6 @@
 from pathlib import Path, PureWindowsPath
 from typing import Optional, Iterator
+import csv
 import re
 import struct
 import subprocess
@@ -611,21 +612,47 @@ def _stream_usn_j(image: Path, offset: int, j_inode: str) -> Iterator[dict]:
 
 
 def _get_all_partition_offsets(image: Path) -> list[tuple[int, str]]:
-    """Return [(start_sector, description)] for every numbered (non-Meta) partition."""
+    """Return [(start_sector, description)] for every numbered (non-Meta) partition.
+
+    Handles both GPT-style ('000', '001') and MBR/DOS-style ('000:000', '000:001')
+    slot names produced by mmls.
+    """
     result = subprocess.run(["mmls", str(image)], capture_output=True, text=True)
     partitions = []
     for line in result.stdout.splitlines():
         m = re.match(r"\d{3}:\s+(\S+)\s+(\d+)\s+\d+\s+\d+\s*(.*)", line)
-        if m and re.fullmatch(r"\d+", m.group(1)):
+        if m and re.fullmatch(r"\d+(?::\d+)?", m.group(1)):
             start = int(m.group(2))
             desc  = m.group(3).strip() or f"sector {start}"
             partitions.append((start, desc))
     return partitions
 
 
-def _check_usnjrnl(image: Path, offset: int, limit: int) -> bool:
+def _check_usnjrnl(
+    image: Path,
+    offset: int,
+    skip: int,
+    limit: int,
+    csv_out: Optional[Path],
+) -> bool:
     """Analyze $UsnJrnl on one partition. Returns True if journal was found."""
-    extend_inode = _find_child(offset, image, None, "$Extend")
+    # Run fls once on the root: detect BitLocker and find $Extend in one shot.
+    root_result = subprocess.run(
+        ["fls", "-o", str(offset), str(image)],
+        capture_output=True, text=True,
+    )
+    combined = (root_result.stdout + root_result.stderr).lower()
+    if "bitlocker" in combined or "encryption detected" in combined:
+        console.print("[yellow]  BitLocker-encrypted partition — cannot read without key.[/yellow]")
+        return False
+
+    extend_inode = next(
+        (re.match(r"[rd]/[rd]\s+(\S+):\t(.+)", ln).group(1)
+         for ln in root_result.stdout.splitlines()
+         if re.match(r"[rd]/[rd]\s+(\S+):\t(.+)", ln)
+         and re.match(r"[rd]/[rd]\s+(\S+):\t(.+)", ln).group(2).strip().lower() == "$extend"),
+        None,
+    )
     if extend_inode is None:
         console.print("[dim]  $Extend not found — skipping (not NTFS).[/dim]")
         return False
@@ -668,40 +695,75 @@ def _check_usnjrnl(image: Path, offset: int, limit: int) -> bool:
 
     console.print("[dim]  Streaming $UsnJrnl:$J (skipping sparse leading zeros)…[/dim]")
 
-    table = Table(
-        title=f"$UsnJrnl:$J{f'  — first {limit} records' if limit else ''}",
-        box=box.ROUNDED,
-        header_style="bold",
-    )
-    table.add_column("USN", justify="right", no_wrap=True)
-    table.add_column("Timestamp", no_wrap=True)
-    table.add_column("Reason")
-    table.add_column("Filename")
-    table.add_column("MFT#", justify="right")
-    table.add_column("Parent MFT#", justify="right")
-
-    count = 0
+    # Collect records. Stop early only when no CSV export is requested.
+    records: list[dict] = []
+    early_stop = False
+    need = (skip + limit) if limit else 0
     for rec in _stream_usn_j(image, offset, j_inode):
-        ts_str = rec["ts"].strftime("%Y-%m-%d %H:%M:%S UTC") if rec["ts"] else "—"
-        table.add_row(
-            str(rec["usn"]),
-            ts_str,
-            _fmt_reasons(rec["reason"]),
-            rec["name"],
-            str(rec["file_mft"]),
-            str(rec["parent_mft"]),
-        )
-        count += 1
-        if limit and count >= limit:
+        records.append(rec)
+        if csv_out is None and need and len(records) >= need:
+            early_stop = True
             break
 
-    if count == 0:
-        console.print("[dim]  No USN records found in $J.[/dim]")
+    # CSV export — always all records, no skip/limit applied.
+    if csv_out is not None:
+        _write_usn_csv(csv_out, records)
+        console.print(f"[green]  Exported {len(records)} records → {csv_out}[/green]")
+
+    # Terminal table — apply skip + limit.
+    display = records[skip: (skip + limit) if limit else None]
+
+    if not display:
+        console.print("[dim]  No USN records to display (check --skip value).[/dim]")
     else:
+        total_hint = "" if not early_stop and not (limit and len(display) == limit) else \
+            f"  records {skip}–{skip + len(display) - 1}"
+        table = Table(
+            title=f"$UsnJrnl:$J{total_hint}",
+            box=box.ROUNDED,
+            header_style="bold",
+        )
+        table.add_column("USN", justify="right", no_wrap=True)
+        table.add_column("Timestamp", no_wrap=True)
+        table.add_column("Reason")
+        table.add_column("Filename")
+        table.add_column("MFT#", justify="right")
+        table.add_column("Parent MFT#", justify="right")
+
+        for rec in display:
+            ts_str = rec["ts"].strftime("%Y-%m-%d %H:%M:%S UTC") if rec["ts"] else "—"
+            table.add_row(
+                str(rec["usn"]),
+                ts_str,
+                _fmt_reasons(rec["reason"]),
+                rec["name"],
+                str(rec["file_mft"]),
+                str(rec["parent_mft"]),
+            )
         console.print(table)
-        if limit and count == limit:
-            console.print(f"[dim]  Showing first {limit} records. Use --limit 0 for all.[/dim]")
+
+        if early_stop or (limit and len(display) == limit):
+            console.print(
+                f"[dim]  Showing records {skip}–{skip + len(display) - 1}."
+                "  Use --skip / --limit for pagination, --limit 0 for all.[/dim]"
+            )
     return True
+
+
+def _write_usn_csv(path: Path, records: list[dict]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["usn", "timestamp", "reason", "filename", "file_mft", "parent_mft"])
+        for rec in records:
+            ts_str = rec["ts"].strftime("%Y-%m-%d %H:%M:%S UTC") if rec["ts"] else ""
+            writer.writerow([
+                rec["usn"],
+                ts_str,
+                _fmt_reasons(rec["reason"]),
+                rec["name"],
+                rec["file_mft"],
+                rec["parent_mft"],
+            ])
 
 
 # ---------------------------------------------------------------------------
@@ -712,7 +774,9 @@ def _check_usnjrnl(image: Path, offset: int, limit: int) -> bool:
 def usnjrnl(
     file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
     offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start sector (checks all if omitted)"),
-    limit: int = typer.Option(50, "--limit", "-n", help="Max records to display per partition (0 = all)"),
+    skip: int = typer.Option(0, "--skip", "-s", help="Skip the first N records before displaying"),
+    limit: int = typer.Option(50, "--limit", "-n", help="Max records to display (0 = all)"),
+    csv_out: Optional[Path] = typer.Option(None, "--csv", "-c", help="Export all records to a CSV file"),
 ):
     """Parse the $UsnJrnl change journal from NTFS partitions in a disk image."""
     if offset is not None:
@@ -726,7 +790,7 @@ def usnjrnl(
     found_any = False
     for part_offset, part_desc in partitions:
         console.rule(f"[bold]{part_desc}  (offset {part_offset})[/bold]")
-        if _check_usnjrnl(file, part_offset, limit):
+        if _check_usnjrnl(file, part_offset, skip, limit, csv_out):
             found_any = True
 
     if not found_any:
