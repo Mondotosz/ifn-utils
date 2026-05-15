@@ -951,3 +951,151 @@ Cleanup when done:
 ```fish
 uv run tool.py image lock bitlocker_partition mnt/ /dev/loop0 ewf/
 ```
+
+### NTFS partition recovery
+
+Find deleted/broken NTFS partitions using the VBR
+
+```fish
+uv run tool.py image vbr-scan exhibits/image/disk.E01
+```
+
+```text
+Partition table: 2 partition(s) at sectors [128, 4194432]
+Mounting image and scanning for VBR signatures…
+Scan complete: 5 VBR signature(s) found.
+
+                                          VBR Scan — disk.E01
+╭─────────┬─────────┬───────────┬─────────────┬───────────────┬───────────┬───────────────────────────╮
+│  Sector │ Role    │ FS        │ Part. Start │ Total Sectors │ Backup At │ Status                    │
+├─────────┼─────────┼───────────┼─────────────┼───────────────┼───────────┼───────────────────────────┤
+│     128 │ Primary │ NTFS      │         128 │     4,194,303 │   4194431 │ ✓ Intact                  │
+│ 1945726 │ Backup  │ NTFS      │         128 │     1,945,598 │   1945726 │ ⚠ Stale (primary resized) │
+│ 4188286 │ Backup  │ NTFS      │     2097279 │     2,091,007 │   4188286 │ ✗ PRIMARY VBR MISSING     │
+│ 4194431 │ Backup  │ NTFS      │         128 │     4,194,303 │   4194431 │ ✓ Intact                  │
+│ 4194432 │ Primary │ BitLocker │     4194432 │             — │         — │ ✓ In part. table          │
+╰─────────┴─────────┴───────────┴─────────────┴───────────────┴───────────┴───────────────────────────╯
+
+╭───────────────────────────────────── Broken Partition Detected ─────────────────────────────────────╮
+│ Backup VBR at sector:   4188286                                                                     │
+│ Expected start sector:  2097279                                                                     │
+│ Partition size:         2,091,007 sectors  (1,020 MiB)                                              │
+│                                                                                                     │
+│ Recover with:                                                                                       │
+│   uv run tool.py image recover-partition exhibits/image/disk.E01 4188286 --output recovered.bin     │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+If a broken partition is found you can recover it with the provided command.
+
+> [!NOTE] The recovered partition might be broken. In this example, the primary
+> VBR as well as \$MFT and \$MFTMirr were overwritten.
+
+With a broken NTFS partition, it's still possible to bruteforce the MFT using
+the following command:
+
+```fish
+uv run tool.py mft scan --raw recovered.bin --deleted
+```
+
+```text
+Raw volume scan of recovered.bin (searching FILE signatures at 512-byte boundaries)…
+                                                  MFT Scan — recovered.bin
+╭──────┬─────────────────────────────┬─────────┬──────┬─────────────────────────┬─────────────────────────┬─────────────────╮
+│ MFT# │ Filename                    │ Parent# │ Type │ Created                 │ Modified                │            Size │
+├──────┼─────────────────────────────┼─────────┼──────┼─────────────────────────┼─────────────────────────┼─────────────────┤
+│    2 │ $LogFile                    │       5 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │ 5,013,504 bytes │
+│    3 │ $Volume                     │       5 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│    4 │ $AttrDef                    │       5 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │     2,400 bytes │
+│    5 │ .                           │       5 │ DIR  │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│    6 │ $Bitmap                     │       5 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │    32,672 bytes │
+│    7 │ $Boot                       │       5 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │     8,192 bytes │
+│    8 │ $BadClus                    │       5 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│    9 │ $Secure                     │       5 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   10 │ $UpCase                     │       5 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │   131,072 bytes │
+│   11 │ $Extend                     │       5 │ DIR  │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   24 │ $Quota                      │      11 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   25 │ $ObjId                      │      11 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   26 │ $Reparse                    │      11 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   27 │ $RmMetadata                 │      11 │ DIR  │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   28 │ $Repair                     │      27 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   29 │ $Deleted                    │      11 │ DIR  │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   30 │ $TxfLog                     │      27 │ DIR  │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   31 │ $Txf                        │      27 │ DIR  │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   32 │ $Tops                       │      30 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   33 │ $TxfLog.blf                 │      30 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   34 │ $TxfLogContainer0000000000… │      30 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   35 │ $TxfLogContainer0000000000… │      30 │ file │ 2025-04-30 13:39:39 UTC │ 2025-04-30 13:39:39 UTC │         0 bytes │
+│   36 │ 00020000000000245FF6D41F    │      29 │ DIR  │ 2025-04-30 09:24:01 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   37 │ 26870853.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:34 UTC │         0 bytes │
+│   38 │ 26869278.ZZZ                │      36 │ file │ 2025-04-30 13:44:38 UTC │ 2025-04-30 14:43:34 UTC │         0 bytes │
+│   39 │ 26870631.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:34 UTC │         0 bytes │
+│   40 │ 26870229.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:34 UTC │         0 bytes │
+│   41 │ 26870846.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:34 UTC │         0 bytes │
+│   42 │ 26869518.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   43 │ 26866740.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   44 │ 26868899.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   45 │ 26866231.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   46 │ 26871038.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   47 │ 26871804.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   48 │ 26871533.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   49 │ 26871225.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   50 │ 26870148.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   51 │ 26870113.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   52 │ 26870216.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   53 │ 26870410.ZZZ                │      36 │ file │ 2025-04-30 13:43:44 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   54 │ 26871899.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   55 │ 26867722.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   56 │ 26867050.ZZZ                │      36 │ file │ 2010-04-17 10:19:49 UTC │ 2025-04-30 14:43:35 UTC │         0 bytes │
+│   57 │ Documents                   │       5 │ DIR  │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   58 │ +ou-.bmp                    │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   59 │ 21.12.2012.wps              │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   60 │ 24.01.07.bmp                │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   61 │ 26.02.07.bmp                │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   62 │ Annonce portes-ouvertes     │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│      │ automales.docx              │         │      │                         │                         │                 │
+│   63 │ Astro Mathilde et Alex.doc  │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   64 │ ChromeSetup.exe             │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   65 │ clownarticle.docx           │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   66 │ ClownAvrilbillets.wps       │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   67 │ cours et pense-b_te.doc     │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   68 │ Document sans titre.wps     │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   69 │ D_marche Ayadi.doc          │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   70 │ D_marche Billioud 2.doc     │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   71 │ D_marche Billioud.doc       │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   72 │ D_marche Boub.doc           │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   73 │ D_marche Ovanis.doc         │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   74 │ Enfants.doc                 │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   75 │ Les bases du                │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│      │ magnétisme.docx             │         │      │                         │                         │                 │
+│   76 │ Logo FFH.JPG                │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   77 │ mspde.doc                   │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   78 │ Organisation du soin.doc    │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   79 │ Pain-proteine.pdf           │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   80 │ Plannif.doc                 │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   81 │ PV_14-~1.DOC                │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   82 │ swissmilk_soupe-a-loignon.… │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   83 │ Tutti fruitti.wps           │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│   84 │ Votre offre SpaDreams       │      57 │ file │ 2025-04-30 13:49:05 UTC │ 2025-04-30 13:49:05 UTC │         0 bytes │
+│      │ 356756.pdf                  │         │      │                         │                         │                 │
+│   85 │ Sub0_glitch.bmp             │       5 │ file │ 2025-04-30 14:29:32 UTC │ 2025-04-30 14:29:32 UTC │         0 bytes │
+│   86 │ 0002000000000056204019CD    │      29 │ DIR  │ 2010-04-17 12:06:17 UTC │ 2025-04-30 14:41:48 UTC │         0 bytes │
+│   87 │ 26761912.ZZZ                │      86 │ file │ 2010-04-17 12:06:17 UTC │ 2025-04-30 14:41:48 UTC │         0 bytes │
+│   88 │ 26765921.ZZZ                │      86 │ file │ 2010-04-17 12:06:19 UTC │ 2025-04-30 14:41:48 UTC │         0 bytes │
+│   89 │ TeraCopyTestFile-1234567890 │       5 │ file │ 2025-04-30 14:27:25 UTC │ 2025-04-30 14:27:25 UTC │         0 bytes │
+│   90 │ 000200000000005A30BB51E7    │      29 │ DIR  │ 2010-04-17 12:09:26 UTC │ 2025-04-30 14:42:01 UTC │         0 bytes │
+│   91 │ 26778574.ZZZ                │      90 │ file │ 2010-04-17 12:09:27 UTC │ 2025-04-30 14:42:01 UTC │         0 bytes │
+│   92 │ 26774123.ZZZ                │      90 │ file │ 2010-04-17 12:09:57 UTC │ 2025-04-30 14:42:01 UTC │         0 bytes │
+│   93 │ 26820280.ZZZ                │       5 │ file │ 2022-10-19 07:03:56 UTC │ 2025-04-30 14:42:45 UTC │         0 bytes │
+│   94 │ TeraCopyTestFile-1234567890 │       5 │ file │ 2025-04-30 14:25:38 UTC │ 2025-04-30 14:25:38 UTC │         0 bytes │
+│   95 │ 26843388.ZZZ                │       5 │ file │ 2010-04-17 12:11:14 UTC │ 2025-04-30 14:43:11 UTC │         0 bytes │
+│   96 │ 26837188.ZZZ                │       5 │ file │ 2010-04-17 12:10:19 UTC │ 2025-04-30 14:43:05 UTC │         0 bytes │
+│   97 │ $RECYCLE.BIN                │       5 │ DIR  │ 2025-04-30 14:14:39 UTC │ 2025-04-30 14:14:39 UTC │         0 bytes │
+│   98 │ S-1-5-21-1518623724-286941… │      97 │ DIR  │ 2025-04-30 14:14:39 UTC │ 2025-04-30 14:14:39 UTC │         0 bytes │
+│   99 │ desktop.ini                 │      98 │ file │ 2025-04-30 14:14:39 UTC │ 2025-04-30 14:14:39 UTC │         0 bytes │
+│  100 │ 26884880.ZZZ                │       5 │ file │ 2014-06-27 11:37:37 UTC │ 2025-04-30 14:43:47 UTC │         0 bytes │
+│  101 │ Je_Vous_Deteste-Fais_comme… │       5 │ file │ 2025-04-30 14:19:59 UTC │ 2025-04-30 14:19:59 UTC │         0 bytes │
+│  102 │ 26889304.ZZZ                │       5 │ file │ 2013-08-14 11:33:13 UTC │ 2025-04-30 14:43:56 UTC │         0 bytes │
+╰──────┴─────────────────────────────┴─────────┴──────┴─────────────────────────┴─────────────────────────┴─────────────────╯
+Scanned 94 record(s), displayed 89  (raw volume scan — FILE records at 512-byte boundaries)
+```

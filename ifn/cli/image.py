@@ -1,5 +1,6 @@
 from pathlib import Path, PureWindowsPath
 from typing import Optional, Iterator
+import contextlib
 import csv
 import re
 import struct
@@ -795,3 +796,298 @@ def usnjrnl(
 
     if not found_any:
         console.print("\n[yellow]No USN journal found on any checked partition.[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# VBR scan helpers
+# ---------------------------------------------------------------------------
+
+_NTFS_OEM = b"NTFS    "
+_BVE_OEM  = b"-FVE-FS-"
+_VBR_SECTOR = 512
+
+
+def _ewfmount_temp(image: Path) -> tuple[Path, Path]:
+    """Mount an EWF image to a fresh temp dir. Returns (tmpdir, ewf1_path).
+    Caller must call _ewfumount(tmpdir) when done."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="ifn_ewf_"))
+    r = subprocess.run(["ewfmount", str(image), str(tmpdir)], capture_output=True, text=True)
+    if r.returncode != 0:
+        tmpdir.rmdir()
+        console.print(f"[red]ewfmount failed: {r.stderr.strip()}[/red]")
+        raise typer.Exit(1)
+    return tmpdir, tmpdir / "ewf1"
+
+
+def _ewfumount(tmpdir: Path) -> None:
+    subprocess.run(["fusermount", "-u", str(tmpdir)], capture_output=True)
+    try:
+        tmpdir.rmdir()
+    except OSError:
+        pass
+
+
+def _decode_ntfs_vbr(data: bytes) -> dict | None:
+    """Decode an NTFS VBR sector. Returns None if the OEM ID is not NTFS."""
+    if len(data) < 512 or data[3:11] != _NTFS_OEM:
+        return None
+    hidden = struct.unpack_from("<I", data, 0x1C)[0]
+    total  = struct.unpack_from("<q", data, 0x28)[0]
+    mft    = struct.unpack_from("<q", data, 0x30)[0]
+    spc    = data[0x0D]
+    return {
+        "hidden_sectors":      hidden,
+        "total_sectors":       total,
+        "backup_sector":       hidden + total,
+        "mft_cluster":         mft,
+        "sectors_per_cluster": spc,
+    }
+
+
+def _scan_vbr_signatures(ewf1: Path) -> list[tuple[int, bytes]]:
+    """Scan an entire raw device image for sectors containing NTFS or BitLocker OEM IDs.
+    Returns (sector_number, sector_bytes) pairs in disk order."""
+    CHUNK = 1024 * 1024  # 1 MB read buffer
+    found: list[tuple[int, bytes]] = []
+    with open(ewf1, "rb") as f:
+        base = 0
+        while True:
+            chunk = f.read(CHUNK)
+            if not chunk:
+                break
+            for i in range(0, len(chunk), _VBR_SECTOR):
+                s = chunk[i: i + _VBR_SECTOR]
+                if len(s) >= 11 and s[3:11] in (_NTFS_OEM, _BVE_OEM):
+                    found.append(((base + i) // _VBR_SECTOR, bytes(s)))
+            base += len(chunk)
+    return found
+
+
+def _read_sector(ewf1: Path, sector: int) -> bytes:
+    with open(ewf1, "rb") as f:
+        f.seek(sector * _VBR_SECTOR)
+        return f.read(_VBR_SECTOR)
+
+
+# ---------------------------------------------------------------------------
+# vbr-scan command
+# ---------------------------------------------------------------------------
+
+@app.command()
+def vbr_scan(
+    file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
+):
+    """Scan all sectors for VBR signatures and identify primary, backup, and broken partitions."""
+    # Collect partition table starts from mmls
+    mmls_result = subprocess.run(["mmls", str(file)], capture_output=True, text=True)
+    known_starts: set[int] = set()
+    for line in mmls_result.stdout.splitlines():
+        m = re.match(r"\d{3}:\s+(\S+)\s+(\d+)\s+\d+\s+\d+", line)
+        if m and re.fullmatch(r"\d+(?::\d+)?", m.group(1)):
+            known_starts.add(int(m.group(2)))
+
+    console.print(f"[dim]Partition table: {len(known_starts)} partition(s) at sectors "
+                  f"{sorted(known_starts)}[/dim]")
+    console.print("[dim]Mounting image and scanning for VBR signatures…[/dim]")
+
+    tmpdir, ewf1 = _ewfmount_temp(file)
+    try:
+        vbrs = _scan_vbr_signatures(ewf1)
+        vbr_map: dict[int, bytes] = {sec: data for sec, data in vbrs}
+
+        console.print(f"[dim]Scan complete: {len(vbrs)} VBR signature(s) found.[/dim]\n")
+
+        table = Table(title=f"VBR Scan — {file.name}", box=box.ROUNDED, header_style="bold")
+        table.add_column("Sector", justify="right")
+        table.add_column("Role")
+        table.add_column("FS")
+        table.add_column("Part. Start", justify="right")
+        table.add_column("Total Sectors", justify="right")
+        table.add_column("Backup At", justify="right")
+        table.add_column("Status", no_wrap=True)
+
+        broken: list[dict] = []
+
+        for sector, data in sorted(vbrs):
+            oem = data[3:11]
+
+            if oem == _BVE_OEM:
+                in_table = sector in known_starts
+                style = "green" if in_table else "yellow"
+                table.add_row(
+                    str(sector), "Primary", "BitLocker",
+                    str(sector), "—", "—",
+                    "✓ In part. table" if in_table else "⚠ Not in part. table",
+                    style=style,
+                )
+                continue
+
+            info = _decode_ntfs_vbr(data)
+            if not info:
+                continue
+
+            H = info["hidden_sectors"]
+            T = info["total_sectors"]
+            B = info["backup_sector"]  # H + T
+
+            if sector == H:
+                # ── Primary VBR ──────────────────────────────────────────
+                role = "Primary"
+                in_table = sector in known_starts
+                backup_data = vbr_map.get(B)
+                backup_valid = backup_data is not None and backup_data[3:11] == _NTFS_OEM
+
+                if in_table and backup_valid:
+                    status, style = "✓ Intact", "green"
+                elif in_table and not backup_valid:
+                    status, style = "⚠ Backup missing", "yellow"
+                elif not in_table and backup_valid:
+                    status, style = "⚠ Not in part. table", "yellow"
+                else:
+                    status, style = "⚠ Orphan primary", "yellow"
+
+            elif sector == B:
+                # ── Backup VBR ───────────────────────────────────────────
+                role = "Backup"
+                primary_data = vbr_map.get(H)
+                if primary_data is not None and primary_data[3:11] == _NTFS_OEM:
+                    primary_info = _decode_ntfs_vbr(primary_data)
+                    if primary_info and primary_info["backup_sector"] == sector:
+                        status, style = "✓ Intact", "green"
+                    else:
+                        # Primary exists but points to a different backup (partition was resized)
+                        status, style = "⚠ Stale (primary resized)", "yellow"
+                else:
+                    # Primary is not an NTFS VBR — check if it's zeroed or garbage
+                    if H not in vbr_map:
+                        raw = _read_sector(ewf1, H)
+                        primary_zeroed = all(b == 0 for b in raw)
+                    else:
+                        primary_zeroed = False
+
+                    if primary_zeroed:
+                        status, style = "✗ PRIMARY VBR MISSING", "red"
+                        broken.append({"sector": sector, "start": H, "total": T, "backup": B})
+                    else:
+                        status, style = "⚠ Primary VBR corrupt", "yellow"
+
+            else:
+                role = "Unknown"
+                status, style = "? (sector ≠ partition start/end)", "dim"
+
+            table.add_row(
+                str(sector), role, "NTFS",
+                str(H), f"{T:,}", str(B),
+                status,
+                style=style,
+            )
+
+        console.print(table)
+
+        if broken:
+            console.print()
+            for b in broken:
+                size_mib = b["total"] * 512 // (1024 * 1024)
+                console.print(Panel(
+                    f"[bold]Backup VBR at sector:[/bold]   {b['sector']}\n"
+                    f"[bold]Expected start sector:[/bold]  {b['start']}\n"
+                    f"[bold]Partition size:[/bold]         {b['total']:,} sectors  ({size_mib:,} MiB)\n\n"
+                    f"[bold]Recover with:[/bold]\n"
+                    f"  uv run tool.py image recover-partition {file} {b['sector']} "
+                    f"--output recovered.bin",
+                    title="[bold red]Broken Partition Detected[/bold red]",
+                    border_style="red",
+                ))
+        else:
+            console.print("[green]No broken partitions detected.[/green]")
+
+    finally:
+        _ewfumount(tmpdir)
+
+
+# ---------------------------------------------------------------------------
+# recover-partition command
+# ---------------------------------------------------------------------------
+
+@app.command()
+def recover_partition(
+    file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
+    backup_sector: int = typer.Argument(..., help="Sector number of the intact backup VBR"),
+    output: Path = typer.Option(..., "--output", "-o", help="Output file for the recovered raw partition"),
+):
+    """Reconstruct a partition whose primary VBR was wiped, using its intact backup VBR.
+
+    Extracts the full partition extent from the image with dd, then copies the
+    backup VBR (last sector) to sector 0, making the partition readable again.
+    """
+    tmpdir, ewf1 = _ewfmount_temp(file)
+    try:
+        # Read and validate the backup VBR
+        vbr_data = _read_sector(ewf1, backup_sector)
+        if vbr_data[3:11] != _NTFS_OEM:
+            console.print(f"[red]Sector {backup_sector} does not contain an NTFS VBR (OEM ID: "
+                          f"{vbr_data[3:11]!r}).[/red]")
+            raise typer.Exit(1)
+
+        info = _decode_ntfs_vbr(vbr_data)
+        assert info  # guaranteed by OEM check above
+        start  = info["hidden_sectors"]
+        total  = info["total_sectors"]
+        backup = info["backup_sector"]
+
+        if backup != backup_sector:
+            console.print(
+                f"[red]Sector {backup_sector} is not the backup VBR of its partition.[/red]\n"
+                f"[dim]  VBR fields: hidden={start}, total={total} → backup at {backup}[/dim]"
+            )
+            raise typer.Exit(1)
+
+        num_sectors = total + 1  # total data sectors + 1 backup VBR sector
+        size_mib = num_sectors * 512 // (1024 * 1024)
+
+        console.print(Panel(
+            f"[bold]Backup VBR sector:[/bold]   {backup_sector}\n"
+            f"[bold]Partition start:[/bold]     sector {start}\n"
+            f"[bold]Partition end:[/bold]       sector {backup_sector}  (inclusive)\n"
+            f"[bold]Size:[/bold]                {num_sectors:,} sectors  ({size_mib:,} MiB)\n"
+            f"[bold]Output file:[/bold]         {output}",
+            title="Partition Recovery Plan",
+        ))
+
+        # Step 1 — extract the raw partition extent
+        console.print(f"\n[yellow]Step 1:[/yellow] Extracting {num_sectors:,} sectors "
+                      f"(sectors {start}–{backup_sector}) with dd…")
+        r = subprocess.run([
+            "dd",
+            f"if={ewf1}",
+            f"of={output}",
+            "bs=512",
+            f"skip={start}",
+            f"count={num_sectors}",
+            "status=progress",
+        ])
+        if r.returncode != 0:
+            console.print("[red]dd extraction failed.[/red]")
+            raise typer.Exit(1)
+
+        # Step 2 — copy backup VBR (now at last sector) to sector 0, patch hidden_sectors→0
+        console.print(f"[yellow]Step 2:[/yellow] Copying backup VBR → sector 0 of {output.name}…")
+        with open(output, "r+b") as f:
+            f.seek(total * _VBR_SECTOR)
+            backup_vbr_bytes = bytearray(f.read(_VBR_SECTOR))
+            # Patch hidden_sectors (0x1C, uint32 LE) to 0 so TSK tools compute MFT
+            # offsets relative to the start of this file rather than the original disk.
+            struct.pack_into("<I", backup_vbr_bytes, 0x1C, 0)
+            f.seek(0)
+            f.write(backup_vbr_bytes)
+
+        console.print(f"\n[green]✓ Partition recovered: {output}[/green]")
+        console.print(
+            f"[dim]  Sector 0 contains the backup VBR with hidden_sectors zeroed.[/dim]\n"
+            f"[dim]  Note: if MFT entry #0/$MFTMirr are damaged (overwritten partition),[/dim]\n"
+            f"[dim]  use raw signature scan to recover surviving file records:[/dim]\n"
+            f"[dim]    uv run tool.py mft scan --raw {output}[/dim]\n"
+            f"[dim]  Standard tools: fls -f ntfs {output}[/dim]"
+        )
+    finally:
+        _ewfumount(tmpdir)
