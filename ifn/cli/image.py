@@ -1,9 +1,12 @@
 from pathlib import Path, PureWindowsPath
-from typing import Optional
+from typing import Optional, Iterator
 import re
+import struct
 import subprocess
 import sys
 import tempfile
+
+from ifn.parsers.windows_time import filetime_to_datetime
 
 import typer
 from rich.console import Console
@@ -459,3 +462,272 @@ def recycle(
         console.print("[dim]No $Recycle.Bin entries found.[/dim]")
     else:
         console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# USN Journal helpers
+# ---------------------------------------------------------------------------
+
+_USN_REASONS: dict[int, str] = {
+    0x00000001: "DATA_OVR",
+    0x00000002: "DATA_EXT",
+    0x00000004: "DATA_TRUNC",
+    0x00000010: "NDATA_OVR",
+    0x00000020: "NDATA_EXT",
+    0x00000040: "NDATA_TRUNC",
+    0x00000100: "CREATE",
+    0x00000200: "DELETE",
+    0x00000400: "EA_CHG",
+    0x00000800: "SEC_CHG",
+    0x00001000: "REN_OLD",
+    0x00002000: "REN_NEW",
+    0x00004000: "IDX_CHG",
+    0x00008000: "BASIC_CHG",
+    0x00010000: "LINK_CHG",
+    0x00020000: "COMP_CHG",
+    0x00040000: "ENC_CHG",
+    0x00080000: "OID_CHG",
+    0x00100000: "REPARSE",
+    0x00200000: "STREAM_CHG",
+    0x00400000: "TRANS_CHG",
+    0x80000000: "CLOSE",
+}
+
+
+def _fmt_reasons(reason: int) -> str:
+    parts = [name for bit, name in _USN_REASONS.items() if reason & bit]
+    return " | ".join(parts) if parts else f"0x{reason:08X}"
+
+
+def _parse_usn_max(data: bytes) -> dict:
+    """Parse the on-disk $Max stream (32-byte format stored in $UsnJrnl).
+
+    On-disk layout (not the same as the user-mode USN_JOURNAL_DATA struct):
+      0x00  uint64  MaximumSize
+      0x08  uint64  AllocationDelta
+      0x10  uint64  JournalId
+      0x18  int64   LowestValidUsn  (0 = all records from start are valid)
+    """
+    if len(data) < 24:
+        raise ValueError(f"$Max too short: {len(data)} bytes (expected ≥24)")
+    return {
+        "max_size":    struct.unpack_from("<Q", data, 0x00)[0],
+        "alloc_delta": struct.unpack_from("<Q", data, 0x08)[0],
+        "journal_id":  struct.unpack_from("<Q", data, 0x10)[0],
+        "lowest_usn":  struct.unpack_from("<q", data, 0x18)[0] if len(data) >= 32 else 0,
+    }
+
+
+def _stream_usn_j(image: Path, offset: int, j_inode: str) -> Iterator[dict]:
+    """Stream-parse USN_RECORD_V2 entries from $UsnJrnl:$J via icat.
+
+    Skips leading sparse (zero) regions automatically without loading the
+    entire file — $J can be hundreds of MB due to NTFS sparse allocation.
+    """
+    proc = subprocess.Popen(
+        ["icat", "-o", str(offset), str(image), j_inode],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    CHUNK = 512 * 1024  # 512 KB read buffer
+    MIN_REC = 60        # USN_RECORD_V2 fixed header size
+
+    try:
+        buf = bytearray()
+        found_records = False
+
+        while True:
+            chunk = proc.stdout.read(CHUNK)
+            if not chunk:
+                break
+            buf.extend(chunk)
+
+            pos = 0
+            while pos < len(buf):
+                # Skip sparse (zero) 4-byte words until first record
+                if pos + 4 > len(buf):
+                    break
+                rec_len = struct.unpack_from("<I", buf, pos)[0]
+                if rec_len == 0:
+                    if not found_records:
+                        # Still in the sparse leading-zero region.  Find the first
+                        # non-zero byte, then back-align to the nearest 4-byte boundary
+                        # so record parsing stays aligned.
+                        nz = next((i for i in range(pos, len(buf)) if buf[i] != 0), None)
+                        if nz is None:
+                            # Entirely zero chunk — discard the whole buffer.
+                            # No leftover bytes: USN records are 8-byte aligned in $J,
+                            # so each chunk boundary stays 4-byte aligned.
+                            pos = len(buf)
+                        else:
+                            pos = nz & ~3  # align down to 4-byte boundary
+                    else:
+                        pos += 4
+                    continue
+
+                if rec_len < MIN_REC or rec_len > 65536:
+                    pos += 4
+                    continue
+                if pos + rec_len > len(buf):
+                    break  # wait for more data
+
+                major = struct.unpack_from("<H", buf, pos + 4)[0]
+                if major != 2:
+                    pos += (rec_len + 7) & ~7
+                    continue
+
+                file_ref = struct.unpack_from("<Q", buf, pos + 8)[0]
+                par_ref  = struct.unpack_from("<Q", buf, pos + 16)[0]
+                usn      = struct.unpack_from("<q", buf, pos + 24)[0]
+                ts_ft    = struct.unpack_from("<Q", buf, pos + 32)[0]
+                reason   = struct.unpack_from("<I", buf, pos + 40)[0]
+                name_len = struct.unpack_from("<H", buf, pos + 56)[0]
+                name_off = struct.unpack_from("<H", buf, pos + 58)[0]
+
+                name_raw = bytes(buf[pos + name_off: pos + name_off + name_len])
+                name = name_raw.decode("utf-16-le", errors="replace") if name_raw else "?"
+
+                try:
+                    ts = filetime_to_datetime(ts_ft) if ts_ft else None
+                except Exception:
+                    ts = None
+
+                found_records = True
+                yield {
+                    "usn":        usn,
+                    "ts":         ts,
+                    "reason":     reason,
+                    "file_mft":   file_ref & 0x0000_FFFF_FFFF_FFFF,
+                    "parent_mft": par_ref  & 0x0000_FFFF_FFFF_FFFF,
+                    "name":       name,
+                }
+
+                pos += (rec_len + 7) & ~7
+
+            del buf[:pos]
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+
+def _get_all_partition_offsets(image: Path) -> list[tuple[int, str]]:
+    """Return [(start_sector, description)] for every numbered (non-Meta) partition."""
+    result = subprocess.run(["mmls", str(image)], capture_output=True, text=True)
+    partitions = []
+    for line in result.stdout.splitlines():
+        m = re.match(r"\d{3}:\s+(\S+)\s+(\d+)\s+\d+\s+\d+\s*(.*)", line)
+        if m and re.fullmatch(r"\d+", m.group(1)):
+            start = int(m.group(2))
+            desc  = m.group(3).strip() or f"sector {start}"
+            partitions.append((start, desc))
+    return partitions
+
+
+def _check_usnjrnl(image: Path, offset: int, limit: int) -> bool:
+    """Analyze $UsnJrnl on one partition. Returns True if journal was found."""
+    extend_inode = _find_child(offset, image, None, "$Extend")
+    if extend_inode is None:
+        console.print("[dim]  $Extend not found — skipping (not NTFS).[/dim]")
+        return False
+
+    entries = _fls_list(offset, image, extend_inode)
+    max_inode = next(
+        (inode for _, inode, name in entries if name.lower() == "$usnjrnl:$max"), None
+    )
+    j_inode = next(
+        (inode for _, inode, name in entries if name.lower() == "$usnjrnl:$j"), None
+    )
+
+    if max_inode is None:
+        console.print("[yellow]  $UsnJrnl not present — journal not enabled on this partition.[/yellow]")
+        return False
+
+    r = subprocess.run(["icat", "-o", str(offset), str(image), max_inode], capture_output=True)
+    if r.returncode != 0 or len(r.stdout) < 24:
+        console.print("[red]  Failed to read $UsnJrnl:$Max.[/red]")
+        return False
+    try:
+        mx = _parse_usn_max(r.stdout)
+    except ValueError as e:
+        console.print(f"[red]  {e}[/red]")
+        return False
+
+    mb = 1024 * 1024
+    console.print(Panel(
+        f"[bold]Journal ID:[/bold]       0x{mx['journal_id']:016X}\n"
+        f"[bold]Lowest Valid USN:[/bold] {mx['lowest_usn']}\n"
+        f"[bold]Maximum Size:[/bold]     {mx['max_size'] // mb} MB\n"
+        f"[bold]Allocation Delta:[/bold] {mx['alloc_delta'] // mb} MB",
+        title="$UsnJrnl:$Max",
+        border_style="green",
+    ))
+
+    if j_inode is None:
+        console.print("[yellow]  $UsnJrnl:$J not found.[/yellow]")
+        return True
+
+    console.print("[dim]  Streaming $UsnJrnl:$J (skipping sparse leading zeros)…[/dim]")
+
+    table = Table(
+        title=f"$UsnJrnl:$J{f'  — first {limit} records' if limit else ''}",
+        box=box.ROUNDED,
+        header_style="bold",
+    )
+    table.add_column("USN", justify="right", no_wrap=True)
+    table.add_column("Timestamp", no_wrap=True)
+    table.add_column("Reason")
+    table.add_column("Filename")
+    table.add_column("MFT#", justify="right")
+    table.add_column("Parent MFT#", justify="right")
+
+    count = 0
+    for rec in _stream_usn_j(image, offset, j_inode):
+        ts_str = rec["ts"].strftime("%Y-%m-%d %H:%M:%S UTC") if rec["ts"] else "—"
+        table.add_row(
+            str(rec["usn"]),
+            ts_str,
+            _fmt_reasons(rec["reason"]),
+            rec["name"],
+            str(rec["file_mft"]),
+            str(rec["parent_mft"]),
+        )
+        count += 1
+        if limit and count >= limit:
+            break
+
+    if count == 0:
+        console.print("[dim]  No USN records found in $J.[/dim]")
+    else:
+        console.print(table)
+        if limit and count == limit:
+            console.print(f"[dim]  Showing first {limit} records. Use --limit 0 for all.[/dim]")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# usnjrnl command
+# ---------------------------------------------------------------------------
+
+@app.command()
+def usnjrnl(
+    file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
+    offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start sector (checks all if omitted)"),
+    limit: int = typer.Option(50, "--limit", "-n", help="Max records to display per partition (0 = all)"),
+):
+    """Parse the $UsnJrnl change journal from NTFS partitions in a disk image."""
+    if offset is not None:
+        partitions = [(offset, f"sector {offset}")]
+    else:
+        partitions = _get_all_partition_offsets(file)
+        if not partitions:
+            console.print("[red]No partitions found via mmls.[/red]")
+            raise typer.Exit(1)
+
+    found_any = False
+    for part_offset, part_desc in partitions:
+        console.rule(f"[bold]{part_desc}  (offset {part_offset})[/bold]")
+        if _check_usnjrnl(file, part_offset, limit):
+            found_any = True
+
+    if not found_any:
+        console.print("\n[yellow]No USN journal found on any checked partition.[/yellow]")
