@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Optional, Iterator
+import csv
 import subprocess
 import struct
 
@@ -427,6 +428,7 @@ def scan(
                                    "(bypasses MFT index; use for broken partitions)"),
     limit: int = typer.Option(0, "--limit", "-n", help="Stop after N records (0 = all)"),
     show_deleted: bool = typer.Option(False, "--deleted", help="Include deleted (not in use) records"),
+    csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export results to a CSV file"),
 ):
     """Iterate MFT records and print a filename table.
 
@@ -458,21 +460,22 @@ def scan(
         console.print("[red]Provide a file argument or --image / --offset.[/red]")
         raise typer.Exit(1)
 
+    _CSV_HEADERS = ["MFT#", "Filename", "Parent#", "Type", "Created", "Modified", "Size"]
+
     table = Table(
         title=f"MFT Scan — {source_name}{'  [raw volume]' if raw else ''}",
         box=box.ROUNDED,
         header_style="bold",
     )
-    table.add_column("MFT#", justify="right")
-    table.add_column("Filename")
-    table.add_column("Parent#", justify="right")
-    table.add_column("Type")
-    table.add_column("Created")
-    table.add_column("Modified")
-    table.add_column("Size", justify="right")
+    for col, kw in zip(
+        _CSV_HEADERS,
+        [{"justify": "right"}, {}, {"justify": "right"}, {}, {}, {}, {"justify": "right"}],
+    ):
+        table.add_column(col, **kw)
 
     count = 0
     shown = 0
+    csv_rows: list[list[str]] = []
 
     for chunk in source:
         if len(chunk) < 48 or chunk[:4] != b"FILE":
@@ -495,7 +498,7 @@ def scan(
             d = fn_attr.decoded
             if not d:
                 continue
-            table.add_row(
+            row = [
                 str(rec.record_number or count),
                 d.get("Filename", "?"),
                 d.get("Parent MFT#", "?"),
@@ -503,7 +506,10 @@ def scan(
                 d.get("Created", "?"),
                 d.get("Modified", "?"),
                 d.get("Real size", "?"),
-            )
+            ]
+            table.add_row(*row)
+            if csv_out is not None:
+                csv_rows.append(row)
             shown += 1
             break
         count += 1
@@ -513,6 +519,13 @@ def scan(
     console.print(table)
     mode = "(raw volume scan)" if raw else ""
     console.print(f"[dim]Scanned {count} record(s), displayed {shown}  {mode}[/dim]")
+
+    if csv_out is not None:
+        with csv_out.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(_CSV_HEADERS)
+            writer.writerows(csv_rows)
+        console.print(f"[green]✓ Exported {shown} row(s) → {csv_out}[/green]")
 
 
 # ---------------------------------------------------------------------------
