@@ -203,18 +203,22 @@ def _display_record(data: bytes, title: str, full_dump: bool = False) -> None:
     attr_table.add_column("ID", justify="right")
     attr_table.add_column("Type")
     attr_table.add_column("Offset", justify="right")
-    attr_table.add_column("Length", justify="right")
+    attr_table.add_column("Hdr (B)", justify="right")
+    attr_table.add_column("Data (B)", justify="right")
     attr_table.add_column("Resident")
     attr_table.add_column("Name")
 
     for attr in rec.attributes:
         if attr.attr_type == 0xFFFFFFFF:
             break
+        hdr_size = "24" if not attr.non_resident else "64"
+        data_size = str(len(attr.data)) if not attr.non_resident else "—"
         attr_table.add_row(
             str(attr.attr_id),
             f"0x{attr.attr_type:02X}  {attr.attr_name}",
             f"0x{attr.offset:04X}",
-            str(attr.length),
+            hdr_size,
+            data_size,
             "No" if attr.non_resident else "Yes",
             attr.name or "—",
         )
