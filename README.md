@@ -191,6 +191,29 @@ Shows every BPB field (OEM ID, bytes/sector, sectors/cluster, FAT size, root
 cluster, volume label, FS type, boot signature) with its offset, raw hex value,
 and interpreted value.
 
+### NTFS VBR
+
+```fish
+uv run tool.py vbr ntfs exhibits/vbr/ntfs_vbr.bin
+```
+
+Decodes the NTFS BIOS Parameter Block: jump code, OEM ID, bytes/sector,
+sectors/cluster, total sectors, `$MFT` and `$MFTMirr` LCNs (and the byte
+offsets they translate to), the **signed** MFT record size and index buffer
+size (with the `2^(-N)` formula applied), the 64-bit volume serial, and the
+`0x55AA` signature.
+
+```fish
+# Read the VBR from an offset inside a larger dump (eg a raw partition):
+uv run tool.py vbr ntfs exhibits/image/partition.bin --offset 0
+```
+
+JSON output for piping into `jq`:
+
+```fish
+uv run tool.py --json vbr ntfs ntfs_vbr.bin | jq '.mft_offset_bytes'
+```
+
 ---
 
 ## lnk — Windows Shortcuts
@@ -539,6 +562,94 @@ uv run tool.py mft scan exhibits/mft/mft.bin --deleted   # include deleted entri
 ╰──────┴──────────────┴─────────┴──────┴─────────────────────────┴─────────────────────────┴──────────────────╯
 Scanned 62 records, displayed 50
 ```
+
+The `mft record` command also decodes:
+
+* **`$OBJECT_ID`** — all 4 GUIDs (Object Id, Birth Volume, Birth Object, Domain).
+* **`$ATTRIBUTE_LIST`** — entries are rendered as a table showing the type,
+  Start VCN, MFT reference and Attribute ID of each split-out attribute.
+* **`$INDEX_ROOT`** — header + entries of the directory B+Tree root (see
+  also the standalone `index` command below).
+* **`$BITMAP`**, **`$REPARSE_POINT`**, **`$VOLUME_NAME`**, **`$VOLUME_INFORMATION`**.
+* **Non-resident attributes** — start/last VCN, allocated/real/initialised size,
+  and a per-run table with the parsed data runs (LCN signed offsets, sparse
+  runs flagged).
+
+### Alternate Data Streams (ADS)
+
+To extract a *named* `$DATA` stream (eg `Zone.Identifier`) instead of the
+file's main content, use `--stream`:
+
+```fish
+uv run tool.py mft record --raw volume.bin --entry 60 \
+    --stream "Zone.Identifier" -x /tmp/zone.txt
+```
+
+Without `--stream`, extraction targets the unnamed `$DATA` (the file body).
+Available stream names are listed in the error message when the requested
+one is missing.
+
+---
+
+## index — NTFS directory indexes ($I30, INDX buffers)
+
+For raw dumps of an `$INDEX_ROOT` body or an `$INDEX_ALLOCATION` stream
+(typical of forensic exhibits collected outside an E01 image).
+
+```fish
+# Decode the root of a small directory (everything fits in $INDEX_ROOT)
+uv run tool.py index root exhibits/index/INDEX_ROOT_body.bin
+```
+
+```fish
+# Decode every INDX buffer in an $INDEX_ALLOCATION dump
+uv run tool.py index indx exhibits/index/INDEX_ALLOCATION.bin --size 4096
+```
+
+The output table lists each indexed file with its MFT reference, namespace
+(POSIX / Win32 / DOS / Win32&DOS), real size and modification time. End-of-
+entries markers are rendered as `LAST`, and non-leaf entries show the VCN of
+the child INDX buffer to follow.
+
+`--size` should match the index buffer size from the VBR (typically 4096 B;
+visible via `vbr ntfs <vbr>` in the *Index buffer size* row). Truncated lab
+exhibits smaller than `--size` are parsed as a single buffer.
+
+JSON output:
+```fish
+uv run tool.py --json index indx INDEX_ALLOCATION.bin --size 4096 \
+    | jq '.[0].entries[] | select(.filename != null) | .filename'
+```
+
+---
+
+## usnj — $UsnJrnl on raw stream dumps
+
+Complementary to `image usnjrnl` (which streams from a live E01 via icat):
+`usnj` works on **standalone `$J` / `$Max` dumps**, which is what most lab
+exhibits provide.
+
+```fish
+# Decode the $Max configuration record (32 B)
+uv run tool.py usnj max exhibits/usnj/Max.bin
+```
+
+```fish
+# List every USN_RECORD_V2 in $J
+uv run tool.py usnj j exhibits/usnj/J.bin
+uv run tool.py usnj j exhibits/usnj/J.bin --limit 50
+uv run tool.py usnj j exhibits/usnj/J.bin --reason FILE_DELETE
+uv run tool.py usnj j exhibits/usnj/J.bin --reason RENAME_NEW_NAME --filename xlsx
+uv run tool.py usnj j exhibits/usnj/J.bin --csv events.csv
+```
+
+Each record is decoded with its USN, FILETIME, filename, file/parent MFT
+reference, file attributes, and the **Reason** flags (`FILE_CREATE`,
+`FILE_DELETE`, `RENAME_OLD_NAME`, `RENAME_NEW_NAME`, `DATA_EXTEND`,
+`DATA_TRUNCATION`, `BASIC_INFO_CHANGE`, `SECURITY_CHANGE`, `CLOSE`, …) and
+**SourceInfo** flags (`DATA_MANAGEMENT`, `AUXILIARY_DATA`,
+`REPLICATION_MANAGEMENT`). Sparse holes at the start of the stream are
+skipped automatically.
 
 ---
 
