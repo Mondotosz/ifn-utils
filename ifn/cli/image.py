@@ -1,7 +1,9 @@
+from __future__ import annotations
 from pathlib import Path, PureWindowsPath
 from typing import Optional, Iterator
 import contextlib
 import csv
+import json
 import re
 import struct
 import subprocess
@@ -11,19 +13,19 @@ import tempfile
 from ifn.parsers.windows_time import filetime_to_datetime
 
 import typer
-from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
 
+from ifn import context
 from ifn.parsers import recycle as _recycle_parser
 from ifn.parsers.sam import parse_v_blob, extract_user_sid
 
 app = typer.Typer(help="Work with EWF/E01 disk images")
-console = Console()
 
 
 def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    console = context.get_console()
     try:
         return subprocess.run(cmd, capture_output=True, text=True, check=check)
     except FileNotFoundError:
@@ -37,29 +39,43 @@ def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
 
 
 @app.command()
-def info(file: Path = typer.Argument(..., help="Path to .E01 image", exists=True)):
+def info(file: Path = typer.Argument(..., help="Path to .E01 image", exists=True)) -> None:
     """Run ewfinfo and display image metadata."""
+    console = context.get_console()
     result = _run(["ewfinfo", str(file)])
-    table = Table(title=f"EWF Info — {file.name}", box=box.ROUNDED, header_style="bold")
-    table.add_column("Field")
-    table.add_column("Value")
+    fields: dict[str, str] = {}
     for line in result.stdout.splitlines():
         if ":" in line and not line.strip().startswith("ewf"):
             key, _, val = line.partition(":")
-            k = key.strip()
-            v = val.strip()
+            k, v = key.strip(), val.strip()
             if k and v:
-                table.add_row(k, v)
+                fields[k] = v
+
+    if context.output_json:
+        print(json.dumps(fields, indent=2))
+        return
+
+    table = Table(title=f"EWF Info — {file.name}", box=box.ROUNDED, header_style="bold")
+    table.add_column("Field")
+    table.add_column("Value")
+    for k, v in fields.items():
+        table.add_row(k, v)
     console.print(table)
 
 
+_MMLS_HEADERS = ["Slot", "Start", "End", "Length", "Description"]
+
+
 @app.command()
-def mmls(file: Path = typer.Argument(..., help="Path to .E01 image", exists=True)):
+def mmls(
+    file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
+    csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export partition table to CSV"),
+) -> None:
     """Run mmls and display the partition table."""
+    console = context.get_console()
     result = _run(["mmls", str(file)])
     lines = result.stdout.splitlines()
 
-    # Parse header lines (before the table)
     header_lines = []
     table_lines = []
     in_table = False
@@ -71,25 +87,34 @@ def mmls(file: Path = typer.Argument(..., help="Path to .E01 image", exists=True
         else:
             header_lines.append(line)
 
+    rows: list[tuple[str, str, str, str, str]] = []
+    for line in table_lines:
+        m = re.match(r"(\d{3}):\s+([\w:/-]+)\s+(\d+)\s+(\d+)\s+(\d+)\s*(.*)", line)
+        if m:
+            num, slot_type, start, end, length, desc = m.groups()
+            rows.append((f"{num} ({slot_type})", start, end, length, desc.strip()))
+
+    if context.output_json:
+        print(json.dumps([
+            {"slot": s, "start": int(st), "end": int(e), "length": int(l), "description": d}
+            for s, st, e, l, d in rows
+        ], indent=2))
+        return
+
     for h in header_lines:
         if h.strip():
             console.print(f"[dim]{h}[/dim]")
 
     pt = Table(title=f"Partition Table — {file.name}", box=box.ROUNDED, header_style="bold")
-    pt.add_column("Slot")
-    pt.add_column("Start", justify="right")
-    pt.add_column("End", justify="right")
-    pt.add_column("Length", justify="right")
-    pt.add_column("Description")
-
-    for line in table_lines:
-        # Format: "NNN:  SLOT_TYPE  START  END  LENGTH  DESCRIPTION"
-        m = re.match(r"(\d{3}):\s+([\w:/-]+)\s+(\d+)\s+(\d+)\s+(\d+)\s*(.*)", line)
-        if m:
-            num, slot_type, start, end, length, desc = m.groups()
-            pt.add_row(f"{num} ({slot_type})", start, end, length, desc.strip())
-
+    for col, kw in zip(_MMLS_HEADERS, [{}, {"justify": "right"}, {"justify": "right"}, {"justify": "right"}, {}]):
+        pt.add_column(col, **kw)
+    for row in rows:
+        pt.add_row(*row)
     console.print(pt)
+    _write_csv(csv_out, _MMLS_HEADERS, [list(r) for r in rows], console)
+
+
+_FLS_HEADERS = ["Type", "Inode", "Name"]
 
 
 @app.command()
@@ -97,8 +122,10 @@ def fls(
     file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
     inode: Optional[str] = typer.Argument(None, help="Partition offset (from mmls Start column) or inode"),
     offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start sector offset"),
-):
+    csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export file listing to CSV"),
+) -> None:
     """Run fls to list files in a partition."""
+    console = context.get_console()
     cmd = ["fls"]
     if offset is not None:
         cmd += ["-o", str(offset)]
@@ -107,19 +134,27 @@ def fls(
     cmd.append(str(file))
 
     result = _run(cmd)
-    ft = Table(title=f"File Listing — {file.name}", box=box.SIMPLE, header_style="bold")
-    ft.add_column("Type")
-    ft.add_column("Inode")
-    ft.add_column("Name")
-
+    rows: list[tuple[str, str, str]] = []
     for line in result.stdout.splitlines():
         if line.strip():
             parts = line.split(None, 2)
             if len(parts) >= 3:
-                ft.add_row(parts[0], parts[1].rstrip(":"), parts[2])
+                rows.append((parts[0], parts[1].rstrip(":"), parts[2]))
             else:
-                ft.add_row("", "", line)
+                rows.append(("", "", line))
+
+    if context.output_json:
+        print(json.dumps([{"type": t, "inode": i, "name": n} for t, i, n in rows], indent=2))
+        return
+
+    ft = Table(title=f"File Listing — {file.name}", box=box.SIMPLE, header_style="bold")
+    ft.add_column("Type")
+    ft.add_column("Inode")
+    ft.add_column("Name")
+    for row in rows:
+        ft.add_row(*row)
     console.print(ft)
+    _write_csv(csv_out, _FLS_HEADERS, [list(r) for r in rows], console)
 
 
 @app.command()
@@ -128,8 +163,9 @@ def icat(
     inode: str = typer.Argument(..., help="Inode number (from fls)"),
     offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start sector offset"),
     output: Optional[Path] = typer.Option(None, "--output", "-O", help="Save to file instead of stdout"),
-):
+) -> None:
     """Run icat to extract a file from the image."""
+    console = context.get_console()
     cmd = ["icat"]
     if offset is not None:
         cmd += ["-o", str(offset)]
@@ -162,6 +198,7 @@ def unlock(
       sudo losetup -o <slot*512> <loop_dev> <ewf_dir>/ewf1
       sudo cryptsetup bitlkOpen <loop_dev> <name>
     """
+    console = context.get_console()
     ewf_path = ewf_dir / "ewf1"
     byte_offset = slot * 512
 
@@ -181,7 +218,6 @@ def unlock(
     _run(["sudo", "losetup", "-o", str(byte_offset), loop_dev, str(ewf_path)])
 
     console.print(f"[yellow]Step 3:[/yellow] sudo cryptsetup bitlkOpen {loop_dev} {name}")
-    # Run without capture so the passphrase prompt is visible
     result = subprocess.run(["sudo", "cryptsetup", "bitlkOpen", loop_dev, name])
     if result.returncode != 0:
         console.print("[red]cryptsetup failed. Run cleanup manually or use 'tool image lock'.[/red]")
@@ -200,6 +236,7 @@ def lock(
     ewf_mount: str = typer.Argument(..., help="Path where EWF is mounted (e.g. ./ewf)"),
 ):
     """Cleanup: unmount, close BitLocker, detach loop device, unmount EWF."""
+    console = context.get_console()
     steps = []
     if mountpoint.upper() != "NONE":
         steps.append(["sudo", "umount", mountpoint])
@@ -224,6 +261,7 @@ def dump(
     output: str = typer.Argument(..., help="Output E01 base path (without extension)"),
 ):
     """Acquire a decrypted BitLocker partition to a new E01 with ewfacquire."""
+    console = context.get_console()
     console.print(Panel(
         f"[bold]Source:[/bold]  {mapper}\n"
         f"[bold]Output:[/bold]  {output}.E01\n\n"
@@ -231,7 +269,6 @@ def dump(
         title="EWF Acquire",
     ))
     console.print(f"[yellow]Running:[/yellow] sudo ewfacquire -t {output} {mapper}")
-    # Run interactively so ewfacquire can prompt for parameters
     result = subprocess.run(["sudo", "ewfacquire", "-t", output, mapper])
     if result.returncode != 0:
         console.print("[red]ewfacquire failed.[/red]")
@@ -245,6 +282,7 @@ def dump(
 
 def _auto_detect_offset(image: Path) -> int:
     """Find the Windows NTFS partition offset via mmls (largest Basic data partition)."""
+    console = context.get_console()
     result = _run(["mmls", str(image)], check=False)
     best_start: int | None = None
     best_len = 0
@@ -319,7 +357,7 @@ def _build_sid_map(sam_path: Path) -> dict[str, str]:
             if sid and v["username"]:
                 sid_map[sid] = v["username"]
     except Exception as e:
-        console.print(f"[yellow]Warning: SAM parse error: {e}[/yellow]")
+        context.get_console().print(f"[yellow]Warning: SAM parse error: {e}[/yellow]")
     return sid_map
 
 
@@ -336,21 +374,22 @@ def recycle(
     extract: Optional[Path] = typer.Option(None, "--extract", "-e", help="Extract $R files to this directory"),
 ):
     """Analyze all $Recycle.Bin entries from a disk image."""
+    console = context.get_console()
     if offset is None:
         offset = _auto_detect_offset(file)
-        console.print(f"[dim]Auto-detected Windows partition at sector {offset}[/dim]")
+        if not context.output_json:
+            console.print(f"[dim]Auto-detected Windows partition at sector {offset}[/dim]")
 
-    # Find $Recycle.Bin inode
     rb_inode = _find_child(offset, file, None, "$Recycle.Bin")
     if not rb_inode:
         console.print("[red]$Recycle.Bin not found in partition root.[/red]")
         raise typer.Exit(1)
 
-    # Build SID→username map
     sid_map: dict[str, str] = {}
     if sam:
         sid_map = _build_sid_map(sam)
-        console.print(f"[dim]SAM loaded from {sam} — {len(sid_map)} SID entries[/dim]")
+        if not context.output_json:
+            console.print(f"[dim]SAM loaded from {sam} — {len(sid_map)} SID entries[/dim]")
     elif auto_sam:
         sam_inode = _find_child(offset, file, None, "Windows")
         for step in ["System32", "config", "SAM"]:
@@ -365,16 +404,19 @@ def recycle(
                                    capture_output=True)
                 tmp_path.write_bytes(r.stdout)
                 sid_map = _build_sid_map(tmp_path)
-                console.print(f"[dim]Auto-extracted SAM ({len(r.stdout):,} bytes) — {len(sid_map)} SID entries[/dim]")
+                if not context.output_json:
+                    console.print(f"[dim]Auto-extracted SAM ({len(r.stdout):,} bytes) — {len(sid_map)} SID entries[/dim]")
             finally:
                 tmp_path.unlink(missing_ok=True)
         else:
-            console.print("[yellow]Warning: SAM not found on image — SIDs will not be resolved.[/yellow]")
+            if not context.output_json:
+                console.print("[yellow]Warning: SAM not found on image — SIDs will not be resolved.[/yellow]")
 
     if extract is not None:
         extract.mkdir(parents=True, exist_ok=True)
 
     # Enumerate SID subdirectories and their $I/$R file pairs
+    json_rows: list[dict] = []
     table = Table(title=f"$Recycle.Bin — {file.name}", box=box.ROUNDED, header_style="bold")
     if sid_map:
         table.add_column("User")
@@ -387,7 +429,6 @@ def recycle(
     for _, sid_inode, sid_name in _fls_list(offset, file, rb_inode):
         username = sid_map.get(sid_name) or _WELL_KNOWN_SIDS.get(sid_name)
 
-        # Build $R suffix→inode map and collect $I entries in one fls call
         dir_entries = _fls_list(offset, file, sid_inode)
         r_map: dict[str, str] = {
             fname[2:]: inode
@@ -395,7 +436,6 @@ def recycle(
             if fname.startswith("$R") and ":" not in fname
         }
 
-        # Prepare per-SID extract directory (created lazily on first file)
         sid_extract_dir: Path | None = None
 
         for _, i_inode, i_fname in dir_entries:
@@ -410,55 +450,67 @@ def recycle(
             try:
                 rec = _recycle_parser.parse_i_file(r.stdout)
                 deleted_str = rec.deleted_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+                deleted_iso = rec.deleted_at.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
                 size_str = f"{rec.file_size:,}"
                 path_str = rec.original_path
             except Exception as e:
-                deleted_str = "[red]parse error[/red]"
+                deleted_str = "parse error"
+                deleted_iso = None
                 size_str = "?"
                 path_str = str(e)
                 rec = None
 
-            row: list[str] = []
-            if sid_map:
-                row.append(username or "[dim]—[/dim]")
-            row += [sid_name, i_fname, deleted_str, size_str, path_str]
-            table.add_row(*row)
+            json_rows.append({
+                "sid": sid_name,
+                "username": username,
+                "i_file": i_fname,
+                "deleted_at": deleted_iso,
+                "file_size": rec.file_size if rec else None,
+                "original_path": path_str,
+            })
 
-            # Extract $I and $R files if requested
+            if not context.output_json:
+                row: list[str] = []
+                if sid_map:
+                    row.append(username or "[dim]—[/dim]")
+                row += [sid_name, i_fname, deleted_str, size_str, path_str]
+                table.add_row(*row)
+
             if extract is not None and rec is not None:
-                suffix = i_fname[2:]  # e.g. "2UXVB4.jpg"
+                suffix = i_fname[2:]
                 r_inode = r_map.get(suffix)
 
-                # Create per-user directory on first file
                 if sid_extract_dir is None:
                     dir_name = username if username else sid_name
                     sid_extract_dir = extract / dir_name
                     sid_extract_dir.mkdir(parents=True, exist_ok=True)
 
-                    # Write info.txt only when username is resolved from SAM
                     if username and username not in _WELL_KNOWN_SIDS.values():
-                        info_txt = (
-                            f"SID:      {sid_name}\n"
-                            f"Username: {username}\n"
-                        )
+                        info_txt = f"SID:      {sid_name}\nUsername: {username}\n"
                         (sid_extract_dir / "info.txt").write_text(info_txt, encoding="utf-8")
 
-                # Extract the $I index file
                 (sid_extract_dir / i_fname).write_bytes(r.stdout)
-                console.print(f"[green]  Extracted {i_fname} → {sid_extract_dir / i_fname}[/green]")
+                if not context.output_json:
+                    console.print(f"[green]  Extracted {i_fname} → {sid_extract_dir / i_fname}[/green]")
 
-                # Extract the matching $R data file
                 if r_inode is None:
-                    console.print(f"[yellow]  No $R file found for {i_fname}[/yellow]")
+                    if not context.output_json:
+                        console.print(f"[yellow]  No $R file found for {i_fname}[/yellow]")
                 else:
                     r_fname = f"$R{suffix}"
                     rdata = subprocess.run(["icat", "-o", str(offset), str(file), r_inode],
                                            capture_output=True)
                     if rdata.returncode == 0:
                         (sid_extract_dir / r_fname).write_bytes(rdata.stdout)
-                        console.print(f"[green]  Extracted $R{suffix} → {sid_extract_dir / r_fname}[/green]")
+                        if not context.output_json:
+                            console.print(f"[green]  Extracted $R{suffix} → {sid_extract_dir / r_fname}[/green]")
                     else:
-                        console.print(f"[red]  Failed to extract $R{suffix}[/red]")
+                        if not context.output_json:
+                            console.print(f"[red]  Failed to extract $R{suffix}[/red]")
+
+    if context.output_json:
+        print(json.dumps(json_rows, indent=2))
+        return
 
     if table.row_count == 0:
         console.print("[dim]No $Recycle.Bin entries found.[/dim]")
@@ -635,17 +687,18 @@ def _check_usnjrnl(
     skip: int,
     limit: int,
     csv_out: Optional[Path],
-) -> bool:
-    """Analyze $UsnJrnl on one partition. Returns True if journal was found."""
-    # Run fls once on the root: detect BitLocker and find $Extend in one shot.
+) -> tuple[bool, list[dict]]:
+    """Analyze $UsnJrnl on one partition. Returns (found, records)."""
+    console = context.get_console()
     root_result = subprocess.run(
         ["fls", "-o", str(offset), str(image)],
         capture_output=True, text=True,
     )
     combined = (root_result.stdout + root_result.stderr).lower()
     if "bitlocker" in combined or "encryption detected" in combined:
-        console.print("[yellow]  BitLocker-encrypted partition — cannot read without key.[/yellow]")
-        return False
+        if not context.output_json:
+            console.print("[yellow]  BitLocker-encrypted partition — cannot read without key.[/yellow]")
+        return False, []
 
     extend_inode = next(
         (re.match(r"[rd]/[rd]\s+(\S+):\t(.+)", ln).group(1)
@@ -655,63 +708,67 @@ def _check_usnjrnl(
         None,
     )
     if extend_inode is None:
-        console.print("[dim]  $Extend not found — skipping (not NTFS).[/dim]")
-        return False
+        if not context.output_json:
+            console.print("[dim]  $Extend not found — skipping (not NTFS).[/dim]")
+        return False, []
 
     entries = _fls_list(offset, image, extend_inode)
-    max_inode = next(
-        (inode for _, inode, name in entries if name.lower() == "$usnjrnl:$max"), None
-    )
-    j_inode = next(
-        (inode for _, inode, name in entries if name.lower() == "$usnjrnl:$j"), None
-    )
+    max_inode = next((inode for _, inode, name in entries if name.lower() == "$usnjrnl:$max"), None)
+    j_inode = next((inode for _, inode, name in entries if name.lower() == "$usnjrnl:$j"), None)
 
     if max_inode is None:
-        console.print("[yellow]  $UsnJrnl not present — journal not enabled on this partition.[/yellow]")
-        return False
+        if not context.output_json:
+            console.print("[yellow]  $UsnJrnl not present — journal not enabled on this partition.[/yellow]")
+        return False, []
 
     r = subprocess.run(["icat", "-o", str(offset), str(image), max_inode], capture_output=True)
     if r.returncode != 0 or len(r.stdout) < 24:
-        console.print("[red]  Failed to read $UsnJrnl:$Max.[/red]")
-        return False
+        if not context.output_json:
+            console.print("[red]  Failed to read $UsnJrnl:$Max.[/red]")
+        return False, []
     try:
         mx = _parse_usn_max(r.stdout)
     except ValueError as e:
-        console.print(f"[red]  {e}[/red]")
-        return False
+        if not context.output_json:
+            console.print(f"[red]  {e}[/red]")
+        return False, []
 
-    mb = 1024 * 1024
-    console.print(Panel(
-        f"[bold]Journal ID:[/bold]       0x{mx['journal_id']:016X}\n"
-        f"[bold]Lowest Valid USN:[/bold] {mx['lowest_usn']}\n"
-        f"[bold]Maximum Size:[/bold]     {mx['max_size'] // mb} MB\n"
-        f"[bold]Allocation Delta:[/bold] {mx['alloc_delta'] // mb} MB",
-        title="$UsnJrnl:$Max",
-        border_style="green",
-    ))
+    if not context.output_json:
+        mb = 1024 * 1024
+        console.print(Panel(
+            f"[bold]Journal ID:[/bold]       0x{mx['journal_id']:016X}\n"
+            f"[bold]Lowest Valid USN:[/bold] {mx['lowest_usn']}\n"
+            f"[bold]Maximum Size:[/bold]     {mx['max_size'] // mb} MB\n"
+            f"[bold]Allocation Delta:[/bold] {mx['alloc_delta'] // mb} MB",
+            title="$UsnJrnl:$Max",
+            border_style="green",
+        ))
 
     if j_inode is None:
-        console.print("[yellow]  $UsnJrnl:$J not found.[/yellow]")
-        return True
+        if not context.output_json:
+            console.print("[yellow]  $UsnJrnl:$J not found.[/yellow]")
+        return True, []
 
-    console.print("[dim]  Streaming $UsnJrnl:$J (skipping sparse leading zeros)…[/dim]")
+    if not context.output_json:
+        console.print("[dim]  Streaming $UsnJrnl:$J (skipping sparse leading zeros)…[/dim]")
 
-    # Collect records. Stop early only when no CSV export is requested.
     records: list[dict] = []
     early_stop = False
     need = (skip + limit) if limit else 0
     for rec in _stream_usn_j(image, offset, j_inode):
         records.append(rec)
-        if csv_out is None and need and len(records) >= need:
+        if csv_out is None and not context.output_json and need and len(records) >= need:
             early_stop = True
             break
 
-    # CSV export — always all records, no skip/limit applied.
     if csv_out is not None:
         _write_usn_csv(csv_out, records)
-        console.print(f"[green]  Exported {len(records)} records → {csv_out}[/green]")
+        if not context.output_json:
+            console.print(f"[green]  Exported {len(records)} records → {csv_out}[/green]")
 
-    # Terminal table — apply skip + limit.
+    if context.output_json:
+        return True, records
+
     display = records[skip: (skip + limit) if limit else None]
 
     if not display:
@@ -748,7 +805,7 @@ def _check_usnjrnl(
                 f"[dim]  Showing records {skip}–{skip + len(display) - 1}."
                 "  Use --skip / --limit for pagination, --limit 0 for all.[/dim]"
             )
-    return True
+    return True, []
 
 
 def _write_usn_csv(path: Path, records: list[dict]) -> None:
@@ -780,6 +837,7 @@ def usnjrnl(
     csv_out: Optional[Path] = typer.Option(None, "--csv", "-c", help="Export all records to a CSV file"),
 ):
     """Parse the $UsnJrnl change journal from NTFS partitions in a disk image."""
+    console = context.get_console()
     if offset is not None:
         partitions = [(offset, f"sector {offset}")]
     else:
@@ -789,10 +847,27 @@ def usnjrnl(
             raise typer.Exit(1)
 
     found_any = False
+    all_records: list[dict] = []
     for part_offset, part_desc in partitions:
-        console.rule(f"[bold]{part_desc}  (offset {part_offset})[/bold]")
-        if _check_usnjrnl(file, part_offset, skip, limit, csv_out):
+        if not context.output_json:
+            console.rule(f"[bold]{part_desc}  (offset {part_offset})[/bold]")
+        found, records = _check_usnjrnl(file, part_offset, skip, limit, csv_out)
+        if found:
             found_any = True
+            all_records.extend(records)
+
+    if context.output_json:
+        def _rec_to_json(r: dict) -> dict:
+            return {
+                "usn": r["usn"],
+                "timestamp": r["ts"].strftime("%Y-%m-%dT%H:%M:%S") + "Z" if r["ts"] else None,
+                "reason": _fmt_reasons(r["reason"]),
+                "filename": r["name"],
+                "file_mft": r["file_mft"],
+                "parent_mft": r["parent_mft"],
+            }
+        print(json.dumps([_rec_to_json(r) for r in all_records], indent=2))
+        return
 
     if not found_any:
         console.print("\n[yellow]No USN journal found on any checked partition.[/yellow]")
@@ -810,6 +885,7 @@ _VBR_SECTOR = 512
 def _ewfmount_temp(image: Path) -> tuple[Path, Path]:
     """Mount an EWF image to a fresh temp dir. Returns (tmpdir, ewf1_path).
     Caller must call _ewfumount(tmpdir) when done."""
+    console = context.get_console()
     tmpdir = Path(tempfile.mkdtemp(prefix="ifn_ewf_"))
     r = subprocess.run(["ewfmount", str(image), str(tmpdir)], capture_output=True, text=True)
     if r.returncode != 0:
@@ -873,12 +949,16 @@ def _read_sector(ewf1: Path, sector: int) -> bytes:
 # vbr-scan command
 # ---------------------------------------------------------------------------
 
+_VBR_SCAN_HEADERS = ["Sector", "Role", "FS", "Part start", "Total sectors", "Backup at", "Status"]
+
+
 @app.command()
 def vbr_scan(
     file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
-):
+    csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export VBR scan results to CSV"),
+) -> None:
     """Scan all sectors for VBR signatures and identify primary, backup, and broken partitions."""
-    # Collect partition table starts from mmls
+    console = context.get_console()
     mmls_result = subprocess.run(["mmls", str(file)], capture_output=True, text=True)
     known_starts: set[int] = set()
     for line in mmls_result.stdout.splitlines():
@@ -886,27 +966,27 @@ def vbr_scan(
         if m and re.fullmatch(r"\d+(?::\d+)?", m.group(1)):
             known_starts.add(int(m.group(2)))
 
-    console.print(f"[dim]Partition table: {len(known_starts)} partition(s) at sectors "
-                  f"{sorted(known_starts)}[/dim]")
-    console.print("[dim]Mounting image and scanning for VBR signatures…[/dim]")
+    if not context.output_json:
+        console.print(f"[dim]Partition table: {len(known_starts)} partition(s) at sectors "
+                      f"{sorted(known_starts)}[/dim]")
+        console.print("[dim]Mounting image and scanning for VBR signatures…[/dim]")
 
     tmpdir, ewf1 = _ewfmount_temp(file)
     try:
         vbrs = _scan_vbr_signatures(ewf1)
         vbr_map: dict[int, bytes] = {sec: data for sec, data in vbrs}
 
-        console.print(f"[dim]Scan complete: {len(vbrs)} VBR signature(s) found.[/dim]\n")
+        if not context.output_json:
+            console.print(f"[dim]Scan complete: {len(vbrs)} VBR signature(s) found.[/dim]\n")
 
         table = Table(title=f"VBR Scan — {file.name}", box=box.ROUNDED, header_style="bold")
-        table.add_column("Sector", justify="right")
-        table.add_column("Role")
-        table.add_column("FS")
-        table.add_column("Part. Start", justify="right")
-        table.add_column("Total Sectors", justify="right")
-        table.add_column("Backup At", justify="right")
-        table.add_column("Status", no_wrap=True)
+        for col, kw in zip(_VBR_SCAN_HEADERS,
+                           [{"justify": "right"}, {}, {}, {"justify": "right"}, {"justify": "right"}, {"justify": "right"}, {"no_wrap": True}]):
+            table.add_column(col, **kw)
 
         broken: list[dict] = []
+        vbr_result_rows: list[dict] = []
+        csv_rows: list[list[str]] = []
 
         for sector, data in sorted(vbrs):
             oem = data[3:11]
@@ -914,75 +994,71 @@ def vbr_scan(
             if oem == _BVE_OEM:
                 in_table = sector in known_starts
                 style = "green" if in_table else "yellow"
-                table.add_row(
-                    str(sector), "Primary", "BitLocker",
-                    str(sector), "—", "—",
-                    "✓ In part. table" if in_table else "⚠ Not in part. table",
-                    style=style,
-                )
+                status = "In part. table" if in_table else "Not in part. table"
+                row = [str(sector), "Primary", "BitLocker", str(sector), "—", "—", status]
+                table.add_row(*row, style=style)
+                csv_rows.append(row)
+                vbr_result_rows.append({"sector": sector, "role": "Primary", "fs": "BitLocker",
+                                        "part_start": sector, "total_sectors": None, "backup_at": None, "status": status})
                 continue
 
-            info = _decode_ntfs_vbr(data)
-            if not info:
+            vbr_info = _decode_ntfs_vbr(data)
+            if not vbr_info:
                 continue
 
-            H = info["hidden_sectors"]
-            T = info["total_sectors"]
-            B = info["backup_sector"]  # H + T
+            H = vbr_info["hidden_sectors"]
+            T = vbr_info["total_sectors"]
+            B = vbr_info["backup_sector"]
 
             if sector == H:
-                # ── Primary VBR ──────────────────────────────────────────
                 role = "Primary"
                 in_table = sector in known_starts
                 backup_data = vbr_map.get(B)
                 backup_valid = backup_data is not None and backup_data[3:11] == _NTFS_OEM
-
                 if in_table and backup_valid:
-                    status, style = "✓ Intact", "green"
+                    status, style = "Intact", "green"
                 elif in_table and not backup_valid:
-                    status, style = "⚠ Backup missing", "yellow"
+                    status, style = "Backup missing", "yellow"
                 elif not in_table and backup_valid:
-                    status, style = "⚠ Not in part. table", "yellow"
+                    status, style = "Not in part. table", "yellow"
                 else:
-                    status, style = "⚠ Orphan primary", "yellow"
-
+                    status, style = "Orphan primary", "yellow"
             elif sector == B:
-                # ── Backup VBR ───────────────────────────────────────────
                 role = "Backup"
                 primary_data = vbr_map.get(H)
                 if primary_data is not None and primary_data[3:11] == _NTFS_OEM:
                     primary_info = _decode_ntfs_vbr(primary_data)
                     if primary_info and primary_info["backup_sector"] == sector:
-                        status, style = "✓ Intact", "green"
+                        status, style = "Intact", "green"
                     else:
-                        # Primary exists but points to a different backup (partition was resized)
-                        status, style = "⚠ Stale (primary resized)", "yellow"
+                        status, style = "Stale (primary resized)", "yellow"
                 else:
-                    # Primary is not an NTFS VBR — check if it's zeroed or garbage
                     if H not in vbr_map:
                         raw = _read_sector(ewf1, H)
                         primary_zeroed = all(b == 0 for b in raw)
                     else:
                         primary_zeroed = False
-
                     if primary_zeroed:
-                        status, style = "✗ PRIMARY VBR MISSING", "red"
+                        status, style = "PRIMARY VBR MISSING", "red"
                         broken.append({"sector": sector, "start": H, "total": T, "backup": B})
                     else:
-                        status, style = "⚠ Primary VBR corrupt", "yellow"
-
+                        status, style = "Primary VBR corrupt", "yellow"
             else:
                 role = "Unknown"
-                status, style = "? (sector ≠ partition start/end)", "dim"
+                status, style = "sector != partition start/end", "dim"
 
-            table.add_row(
-                str(sector), role, "NTFS",
-                str(H), f"{T:,}", str(B),
-                status,
-                style=style,
-            )
+            row = [str(sector), role, "NTFS", str(H), f"{T:,}", str(B), status]
+            table.add_row(*row, style=style)
+            csv_rows.append(row)
+            vbr_result_rows.append({"sector": sector, "role": role, "fs": "NTFS",
+                                    "part_start": H, "total_sectors": T, "backup_at": B, "status": status})
+
+        if context.output_json:
+            print(json.dumps(vbr_result_rows, indent=2))
+            return
 
         console.print(table)
+        _write_csv(csv_out, _VBR_SCAN_HEADERS, csv_rows, console)
 
         if broken:
             console.print()
@@ -1020,20 +1096,20 @@ def recover_partition(
     Extracts the full partition extent from the image with dd, then copies the
     backup VBR (last sector) to sector 0, making the partition readable again.
     """
+    console = context.get_console()
     tmpdir, ewf1 = _ewfmount_temp(file)
     try:
-        # Read and validate the backup VBR
         vbr_data = _read_sector(ewf1, backup_sector)
         if vbr_data[3:11] != _NTFS_OEM:
             console.print(f"[red]Sector {backup_sector} does not contain an NTFS VBR (OEM ID: "
                           f"{vbr_data[3:11]!r}).[/red]")
             raise typer.Exit(1)
 
-        info = _decode_ntfs_vbr(vbr_data)
-        assert info  # guaranteed by OEM check above
-        start  = info["hidden_sectors"]
-        total  = info["total_sectors"]
-        backup = info["backup_sector"]
+        vbr_info = _decode_ntfs_vbr(vbr_data)
+        assert vbr_info
+        start  = vbr_info["hidden_sectors"]
+        total  = vbr_info["total_sectors"]
+        backup = vbr_info["backup_sector"]
 
         if backup != backup_sector:
             console.print(
@@ -1042,7 +1118,7 @@ def recover_partition(
             )
             raise typer.Exit(1)
 
-        num_sectors = total + 1  # total data sectors + 1 backup VBR sector
+        num_sectors = total + 1
         size_mib = num_sectors * 512 // (1024 * 1024)
 
         console.print(Panel(
@@ -1054,29 +1130,20 @@ def recover_partition(
             title="Partition Recovery Plan",
         ))
 
-        # Step 1 — extract the raw partition extent
         console.print(f"\n[yellow]Step 1:[/yellow] Extracting {num_sectors:,} sectors "
                       f"(sectors {start}–{backup_sector}) with dd…")
         r = subprocess.run([
-            "dd",
-            f"if={ewf1}",
-            f"of={output}",
-            "bs=512",
-            f"skip={start}",
-            f"count={num_sectors}",
-            "status=progress",
+            "dd", f"if={ewf1}", f"of={output}", "bs=512",
+            f"skip={start}", f"count={num_sectors}", "status=progress",
         ])
         if r.returncode != 0:
             console.print("[red]dd extraction failed.[/red]")
             raise typer.Exit(1)
 
-        # Step 2 — copy backup VBR (now at last sector) to sector 0, patch hidden_sectors→0
         console.print(f"[yellow]Step 2:[/yellow] Copying backup VBR → sector 0 of {output.name}…")
         with open(output, "r+b") as f:
             f.seek(total * _VBR_SECTOR)
             backup_vbr_bytes = bytearray(f.read(_VBR_SECTOR))
-            # Patch hidden_sectors (0x1C, uint32 LE) to 0 so TSK tools compute MFT
-            # offsets relative to the start of this file rather than the original disk.
             struct.pack_into("<I", backup_vbr_bytes, 0x1C, 0)
             f.seek(0)
             f.write(backup_vbr_bytes)
@@ -1091,3 +1158,13 @@ def recover_partition(
         )
     finally:
         _ewfumount(tmpdir)
+
+
+def _write_csv(path: Optional[Path], headers: list[str], rows: list[list[str]], console) -> None:
+    if path is None:
+        return
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(headers)
+        writer.writerows(rows)
+    console.print(f"[green]✓ Exported {len(rows)} row(s) → {path}[/green]")

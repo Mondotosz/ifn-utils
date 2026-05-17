@@ -1,27 +1,35 @@
+from __future__ import annotations
+import json
+import struct
 from pathlib import Path
 
 import typer
-from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
-from rich import box
-import struct
 
+from ifn import context
 from ifn.parsers import recycle
 from ifn.display.hex_table import render_hex_table
 
 app = typer.Typer(help="Parse Windows Recycle Bin artifacts")
-console = Console()
 
 
 @app.command()
-def info(file: Path = typer.Argument(..., help="Path to $I index file", exists=True)):
+def info(file: Path = typer.Argument(..., help="Path to $I index file", exists=True)) -> None:
     """Parse a $I Recycle Bin index file (original path, size, deletion time)."""
+    console = context.get_console()
     data = file.read_bytes()
     rec = recycle.parse_i_file(data)
 
-    deletion_ft = struct.unpack_from("<Q", data, 16)[0]
+    if context.output_json:
+        print(json.dumps({
+            "version": rec.version,
+            "file_size": rec.file_size,
+            "deleted_at": rec.deleted_at.strftime("%Y-%m-%dT%H:%M:%S") + "Z",
+            "original_path": rec.original_path,
+        }, indent=2))
+        return
 
+    deletion_ft = struct.unpack_from("<Q", data, 16)[0]
     fields: list[tuple[int, int, str, str]] = [
         (0,  8, "Version",           str(rec.version)),
         (8,  8, "Original file size", f"{rec.file_size:,} bytes"),
@@ -33,7 +41,7 @@ def info(file: Path = typer.Argument(..., help="Path to $I index file", exists=T
     else:
         fields.append((24, 520, "Original path (UTF-16LE, 260 chars)", rec.original_path))
 
-    render_hex_table(data, fields, title=f"Recycle Bin $I — {file.name}")
+    render_hex_table(data, fields, title=f"Recycle Bin $I — {file.name}", console=console)
 
     console.print(Panel(
         f"[bold]Version:[/bold]       {rec.version}\n"
@@ -46,10 +54,19 @@ def info(file: Path = typer.Argument(..., help="Path to $I index file", exists=T
 
 
 @app.command()
-def dump(file: Path = typer.Argument(..., help="Path to $R data file", exists=True)):
+def dump(file: Path = typer.Argument(..., help="Path to $R data file", exists=True)) -> None:
     """Show hex preview of a $R Recycle Bin data file."""
+    console = context.get_console()
     data = file.read_bytes()
-    preview = data[:256]  # first 256 bytes
+    preview = data[:256]
+
+    if context.output_json:
+        print(json.dumps({
+            "file": str(file),
+            "size": len(data),
+            "preview_hex": preview.hex(" ").upper(),
+        }, indent=2))
+        return
 
     console.print(Panel(
         f"[bold]File:[/bold]  {file}\n"
@@ -57,4 +74,4 @@ def dump(file: Path = typer.Argument(..., help="Path to $R data file", exists=Tr
         f"[bold]Showing first {len(preview)} bytes[/bold]",
         title=f"$R file — {file.name}",
     ))
-    render_hex_table(preview, [], title="")
+    render_hex_table(preview, [], title="", console=console)

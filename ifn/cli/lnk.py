@@ -1,13 +1,15 @@
+from __future__ import annotations
+import json
 from pathlib import Path
 
 import typer
-from rich.console import Console
 from rich.table import Table
 from rich import box
 import LnkParse3
 
+from ifn import context
+
 app = typer.Typer(help="Parse Windows LNK shortcut files")
-console = Console()
 
 _SHOW_WINDOW = {
     1: "Normal", 2: "Minimized", 3: "Maximized", 4: "Normal (no activate)",
@@ -16,7 +18,7 @@ _SHOW_WINDOW = {
 }
 
 
-def _flat_table(title: str, data: dict, parent_key: str = "") -> Table:
+def _flat_table(title: str, data: dict) -> Table:
     t = Table(title=title, box=box.ROUNDED, header_style="bold", show_header=True)
     t.add_column("Field")
     t.add_column("Value")
@@ -32,14 +34,19 @@ def _flat_table(title: str, data: dict, parent_key: str = "") -> Table:
 
 
 @app.command()
-def parse(file: Path = typer.Argument(..., help="Path to .lnk file", exists=True)):
+def parse(file: Path = typer.Argument(..., help="Path to .lnk file", exists=True)) -> None:
     """Extract all fields from a Windows Shell Link file."""
+    console = context.get_console()
     with file.open("rb") as f:
         lnk = LnkParse3.lnk_file(f)
 
     data = lnk.get_json(get_all=True)
 
-    # Header
+    if context.output_json:
+        # LnkParse3 already produces a JSON-serialisable dict
+        print(json.dumps(data, indent=2, default=str))
+        return
+
     hdr = data.get("header", {})
     hdr_table = Table(title=f"LNK Header — {file.name}", box=box.ROUNDED, header_style="bold")
     hdr_table.add_column("Field")
@@ -59,7 +66,6 @@ def parse(file: Path = typer.Argument(..., help="Path to .lnk file", exists=True
     hdr_table.add_row("File flags",    str(file_flags))
     console.print(hdr_table)
 
-    # Target (ID list)
     target = data.get("target")
     if target:
         t = Table(title="Link Target ID List", box=box.ROUNDED, header_style="bold")
@@ -75,12 +81,10 @@ def parse(file: Path = typer.Argument(..., help="Path to .lnk file", exists=True
                 t.add_row(f"Item {i}", str(item))
         console.print(t)
 
-    # Link info
     link_info = data.get("link_info", {})
     if link_info:
         console.print(_flat_table("Link Info", link_info))
 
-    # String data
     strings = data.get("data", {})
     if strings:
         st = Table(title="String Data", box=box.ROUNDED, header_style="bold")
@@ -90,7 +94,6 @@ def parse(file: Path = typer.Argument(..., help="Path to .lnk file", exists=True
             st.add_row(str(k), str(v))
         console.print(st)
 
-    # Extra data
     extras = data.get("extra", {})
     if extras:
         et = Table(title="Extra Data", box=box.ROUNDED, header_style="bold")

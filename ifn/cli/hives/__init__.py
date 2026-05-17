@@ -1,19 +1,22 @@
+from __future__ import annotations
+import json
 from pathlib import Path
 from typing import Optional
 
 import typer
-from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 from rich.tree import Tree
 from rich import box
 from Registry import Registry
 
+from ifn import context
+
 app = typer.Typer(help="Parse Windows Registry hive files")
-console = Console()
 
 
 def _open_hive(path: Path) -> Registry.Registry:
+    console = context.get_console()
     try:
         return Registry.Registry(str(path))
     except Exception as e:
@@ -30,7 +33,17 @@ def _fmt_ts(ts) -> str:
         return str(ts)
 
 
+def _fmt_ts_iso(ts) -> str | None:
+    if ts is None:
+        return None
+    try:
+        return ts.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    except Exception:
+        return str(ts)
+
+
 def _key_path(reg: Registry.Registry, path: str | None) -> Registry.RegistryKey:
+    console = context.get_console()
     try:
         if path:
             return reg.open(path)
@@ -40,7 +53,19 @@ def _key_path(reg: Registry.Registry, path: str | None) -> Registry.RegistryKey:
         raise typer.Exit(1)
 
 
-def _build_tree(node: Tree, key: Registry.RegistryKey, current_depth: int, max_depth: int) -> None:
+def _val_to_json(val) -> str | int | list | None:
+    try:
+        raw = val.value()
+        if isinstance(raw, bytes):
+            return raw.hex(" ").upper()
+        if isinstance(raw, list):
+            return [str(x) for x in raw]
+        return raw
+    except Exception:
+        return None
+
+
+def _build_tree(node: Tree, key, current_depth: int, max_depth: int) -> None:
     if current_depth >= max_depth:
         remaining = len(list(key.subkeys()))
         if remaining:
@@ -52,15 +77,32 @@ def _build_tree(node: Tree, key: Registry.RegistryKey, current_depth: int, max_d
         _build_tree(child, subkey, current_depth + 1, max_depth)
 
 
+def _build_tree_dict(key, current_depth: int, max_depth: int) -> dict:
+    result = {
+        "name": key.name(),
+        "timestamp": _fmt_ts_iso(key.timestamp()),
+        "children": [],
+    }
+    if current_depth < max_depth:
+        for subkey in key.subkeys():
+            result["children"].append(_build_tree_dict(subkey, current_depth + 1, max_depth))
+    return result
+
+
 @app.command()
 def tree(
     hive: Path = typer.Argument(..., help="Path to hive file", exists=True),
     path: Optional[str] = typer.Argument(None, help="Registry key path to start from (default: root)"),
     depth: int = typer.Option(2, "--depth", "-d", help="Maximum depth to expand"),
-):
+) -> None:
     """Show a tree view of registry subkeys up to a given depth."""
+    console = context.get_console()
     reg = _open_hive(hive)
     key = _key_path(reg, path)
+
+    if context.output_json:
+        print(json.dumps(_build_tree_dict(key, 0, depth), indent=2))
+        return
 
     display_path = path or key.name()
     root_label = (
@@ -73,10 +115,21 @@ def tree(
 
 
 @app.command()
-def info(hive: Path = typer.Argument(..., help="Path to hive file", exists=True)):
+def info(hive: Path = typer.Argument(..., help="Path to hive file", exists=True)) -> None:
     """Show hive type, root key name, and last written timestamp."""
+    console = context.get_console()
     reg = _open_hive(hive)
     root = reg.root()
+
+    if context.output_json:
+        print(json.dumps({
+            "file": str(hive),
+            "hive_type": reg.hive_type().name,
+            "root_key": root.name(),
+            "last_written": _fmt_ts_iso(root.timestamp()),
+        }, indent=2))
+        return
+
     console.print(Panel(
         f"[bold]File:[/bold]         {hive}\n"
         f"[bold]Hive type:[/bold]    {reg.hive_type().name}\n"
@@ -91,12 +144,28 @@ def info(hive: Path = typer.Argument(..., help="Path to hive file", exists=True)
 def ls(
     hive: Path = typer.Argument(..., help="Path to hive file", exists=True),
     path: Optional[str] = typer.Argument(None, help="Registry key path (default: root)"),
-):
+) -> None:
     """List subkeys and values under a registry path."""
+    console = context.get_console()
     reg = _open_hive(hive)
     key = _key_path(reg, path)
-
     display_path = path or key.name()
+
+    if context.output_json:
+        print(json.dumps({
+            "key": display_path,
+            "last_written": _fmt_ts_iso(key.timestamp()),
+            "subkeys": [
+                {"name": sk.name(), "last_written": _fmt_ts_iso(sk.timestamp())}
+                for sk in key.subkeys()
+            ],
+            "values": [
+                {"name": v.name() or "(Default)", "type": v.value_type_str(), "data": _val_to_json(v)}
+                for v in key.values()
+            ],
+        }, indent=2))
+        return
+
     console.rule(f"[bold]{display_path}[/bold]")
     console.print(f"[dim]Last written: {_fmt_ts(key.timestamp())}[/dim]")
 
@@ -141,8 +210,9 @@ def get(
     path: str = typer.Argument(..., help="Registry key path"),
     value: str = typer.Argument(..., help="Value name"),
     dump: Optional[Path] = typer.Option(None, "--dump", "-d", help="Dump raw value bytes to this file"),
-):
+) -> None:
     """Print a single registry value with its type and data."""
+    console = context.get_console()
     reg = _open_hive(hive)
     key = _key_path(reg, path)
 
@@ -163,6 +233,16 @@ def get(
             data_str = str(raw)
     except Exception as e:
         data_str = f"Error: {e}"
+        raw = None
+
+    if context.output_json:
+        print(json.dumps({
+            "key": path,
+            "name": val.name() or "(Default)",
+            "type": vtype,
+            "data": _val_to_json(val),
+        }, indent=2))
+        return
 
     console.print(Panel(
         f"[bold]Key:[/bold]   {path}\n"

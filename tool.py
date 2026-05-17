@@ -15,6 +15,16 @@ app.add_typer(time.app, name="time")
 app.add_typer(deps.app, name="deps")
 
 
+@app.callback()
+def root_callback(
+    ctx: typer.Context,
+    json_out: bool = typer.Option(False, "--json", help="Output as JSON to stdout (for jq)"),
+    simple: bool = typer.Option(False, "--simple", help="Plain output without colors or markup"),
+) -> None:
+    from ifn import context
+    context.configure(json_out=json_out, simple=simple)
+
+
 def main():
     app()
 

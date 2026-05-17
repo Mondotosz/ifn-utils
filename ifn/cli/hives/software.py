@@ -1,19 +1,26 @@
+from __future__ import annotations
+import csv
+import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import typer
-from rich.console import Console
 from rich.table import Table
 from rich import box
 from Registry import Registry
 
+from ifn import context
 from ifn.parsers.windows_time import filetime_to_datetime
 
 app = typer.Typer(help="SOFTWARE hive analysis")
-console = Console()
+
+_AUTORUN_HEADERS = ["Source", "Name", "Command"]
+_PROFILES_HEADERS = ["SID", "RID", "Profile path", "Last written"]
 
 
 def _open_hive(path: Path) -> Registry.Registry:
+    console = context.get_console()
     try:
         return Registry.Registry(str(path))
     except Exception as e:
@@ -30,9 +37,17 @@ def _val(key, name: str, default: str = "—") -> str:
         return default
 
 
+def _val_raw(key, name: str):
+    try:
+        return key.value(name).value()
+    except Exception:
+        return None
+
+
 @app.command()
-def info(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=True)):
+def info(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=True)) -> None:
     """Comprehensive Windows installation info from Microsoft\\Windows NT\\CurrentVersion."""
+    console = context.get_console()
     reg = _open_hive(hive)
     try:
         key = reg.open("Microsoft\\Windows NT\\CurrentVersion")
@@ -61,12 +76,7 @@ def info(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=T
         except Exception:
             return "—"
 
-    table = Table(title="SOFTWARE — Windows Installation", box=box.ROUNDED, header_style="bold")
-    table.add_column("Field", style="bold", no_wrap=True)
-    table.add_column("Value")
-
-    for field, value in [
-        # Identity
+    fields = [
         ("ProductName",                _val(key, "ProductName")),
         ("SoftwareType",               _val(key, "SoftwareType")),
         ("InstallationType",           _val(key, "InstallationType")),
@@ -75,11 +85,9 @@ def info(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=T
         ("EditionSubstring",           _val(key, "EditionSubstring")),
         ("EditionSubVersion",          _val(key, "EditionSubVersion")),
         ("EditionSubManufacturer",     _val(key, "EditionSubManufacturer")),
-        # Owner / registration
         ("RegisteredOwner",            _val(key, "RegisteredOwner")),
         ("RegisteredOrganization",     _val(key, "RegisteredOrganization")),
         ("ProductId",                  _val(key, "ProductId")),
-        # Version
         ("DisplayVersion",             _val(key, "DisplayVersion")),
         ("ReleaseId",                  _val(key, "ReleaseId")),
         ("CurrentVersion",             _val(key, "CurrentVersion")),
@@ -90,37 +98,39 @@ def info(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=T
         ("CurrentBuildNumber",         _val(key, "CurrentBuildNumber")),
         ("BaseBuildRevisionNumber",    _val(key, "BaseBuildRevisionNumber")),
         ("UBR",                        _val(key, "UBR")),
-        # Build info
         ("BuildBranch",                _val(key, "BuildBranch")),
         ("BuildLab",                   _val(key, "BuildLab")),
         ("BuildLabEx",                 _val(key, "BuildLabEx")),
         ("BuildGUID",                  _val(key, "BuildGUID")),
-        # Paths
         ("SystemRoot",                 _val(key, "SystemRoot")),
         ("PathName",                   _val(key, "PathName")),
-        # Recovery
         ("WinREVersion",               _val(key, "WinREVersion")),
-        # Timestamps
         ("InstallDate",                _ts_unix("InstallDate")),
         ("InstallTime",                _ts_ft("InstallTime")),
-        # Binary IDs (first 32 bytes as hex)
         ("DigitalProductId",           _hex("DigitalProductId")),
         ("DigitalProductId4",          _hex("DigitalProductId4")),
-    ]:
-        table.add_row(field, value if value != "—" else "[dim]—[/dim]")
+    ]
 
+    if context.output_json:
+        print(json.dumps(dict(fields), indent=2))
+        return
+
+    table = Table(title="SOFTWARE — Windows Installation", box=box.ROUNDED, header_style="bold")
+    table.add_column("Field", style="bold", no_wrap=True)
+    table.add_column("Value")
+    for field, value in fields:
+        table.add_row(field, value if value != "—" else "[dim]—[/dim]")
     console.print(table)
 
 
 @app.command()
-def autorun(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=True)):
+def autorun(
+    hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=True),
+    csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export autorun entries to CSV file"),
+) -> None:
     """List auto-start programs from Run and RunOnce keys."""
+    console = context.get_console()
     reg = _open_hive(hive)
-
-    table = Table(title="Auto-Start Programs", box=box.ROUNDED, header_style="bold")
-    table.add_column("Source")
-    table.add_column("Name")
-    table.add_column("Command")
 
     run_paths = [
         "Microsoft\\Windows\\CurrentVersion\\Run",
@@ -130,6 +140,7 @@ def autorun(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exist
         "WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
     ]
 
+    rows: list[tuple[str, str, str]] = []
     for path in run_paths:
         try:
             key = reg.open(path)
@@ -137,17 +148,35 @@ def autorun(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exist
             continue
         short = path.rsplit("\\", 2)[-2] + "\\" + path.rsplit("\\", 1)[-1]
         for val in key.values():
-            table.add_row(short, val.name() or "(Default)", str(val.value()))
+            rows.append((short, val.name() or "(Default)", str(val.value())))
 
-    if table.row_count == 0:
+    if context.output_json:
+        print(json.dumps([{"source": s, "name": n, "command": c} for s, n, c in rows], indent=2))
+        return
+
+    if not rows:
         console.print("[dim]No auto-start entries found.[/dim]")
-    else:
-        console.print(table)
+        return
+
+    table = Table(title="Auto-Start Programs", box=box.ROUNDED, header_style="bold")
+    table.add_column("Source")
+    table.add_column("Name")
+    table.add_column("Command")
+    csv_rows: list[list[str]] = []
+    for source, name, command in rows:
+        table.add_row(source, name, command)
+        csv_rows.append([source, name, command])
+    console.print(table)
+    _write_csv(csv_out, _AUTORUN_HEADERS, csv_rows, console)
 
 
 @app.command()
-def profiles(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=True)):
+def profiles(
+    hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exists=True),
+    csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export profiles to CSV file"),
+) -> None:
     """List user profiles: SID → home directory mapping."""
+    console = context.get_console()
     reg = _open_hive(hive)
     try:
         pl_key = reg.open("Microsoft\\Windows NT\\CurrentVersion\\ProfileList")
@@ -155,21 +184,43 @@ def profiles(hive: Path = typer.Argument(..., help="Path to SOFTWARE hive", exis
         console.print("[red]ProfileList key not found.[/red]")
         raise typer.Exit(1)
 
+    profile_rows: list[tuple[str, str, str, str]] = []
+    for subkey in pl_key.subkeys():
+        sid = subkey.name()
+        rid_str = sid.rsplit("-", 1)[-1] if "-" in sid else "—"
+        try:
+            profile_path = str(subkey.value("ProfileImagePath").value())
+        except Exception:
+            profile_path = "—"
+        ts = subkey.timestamp()
+        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "—"
+        profile_rows.append((sid, rid_str, profile_path, ts_str))
+
+    if context.output_json:
+        print(json.dumps([
+            {"sid": sid, "rid": rid, "profile_path": path, "last_written": ts}
+            for sid, rid, path, ts in profile_rows
+        ], indent=2))
+        return
+
     table = Table(title="User Profiles", box=box.ROUNDED, header_style="bold")
     table.add_column("SID")
     table.add_column("RID", justify="right")
     table.add_column("Profile path")
     table.add_column("Last written")
-
-    for subkey in pl_key.subkeys():
-        sid = subkey.name()
-        rid_str = sid.rsplit("-", 1)[-1] if "-" in sid else "—"
-        try:
-            profile_path = subkey.value("ProfileImagePath").value()
-        except Exception:
-            profile_path = "—"
-        ts = subkey.timestamp()
-        ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "—"
-        table.add_row(sid, rid_str, str(profile_path), ts_str)
-
+    csv_rows: list[list[str]] = []
+    for sid, rid_str, profile_path, ts_str in profile_rows:
+        table.add_row(sid, rid_str, profile_path, ts_str)
+        csv_rows.append([sid, rid_str, profile_path, ts_str])
     console.print(table)
+    _write_csv(csv_out, _PROFILES_HEADERS, csv_rows, console)
+
+
+def _write_csv(path: Optional[Path], headers: list[str], rows: list[list[str]], console) -> None:
+    if path is None:
+        return
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(headers)
+        writer.writerows(rows)
+    console.print(f"[green]✓ Exported {len(rows)} row(s) → {path}[/green]")

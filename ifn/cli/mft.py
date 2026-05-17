@@ -1,20 +1,20 @@
+from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Iterator
 import csv
+import json
 import subprocess
 import struct
 
 import typer
-from rich.console import Console
 from rich.table import Table
-from rich.panel import Panel
 from rich import box
 
+from ifn import context
 from ifn.parsers import mft_record as mft_parser
 from ifn.display.hex_table import render_hex_table
 
 app = typer.Typer(help="Parse NTFS Master File Table records")
-console = Console()
 
 _RECORD_SIZE = 1024
 _SECTOR = 512
@@ -172,8 +172,10 @@ def _find_entry_raw(vol: Path, entry_num: int) -> bytes | None:
 # Shared display helper
 # ---------------------------------------------------------------------------
 
-def _display_record(data: bytes, title: str, full_dump: bool = False) -> None:
+def _display_record(data: bytes, title: str, full_dump: bool = False, console=None):
     """Pretty-print one MFT record: hex table, attribute list, decoded fields."""
+    if console is None:
+        console = context.get_console()
     fixed = _apply_usa_fixup(data)
     rec = mft_parser.parse(fixed)
 
@@ -181,58 +183,59 @@ def _display_record(data: bytes, title: str, full_dump: bool = False) -> None:
         console.print(f"[red]Invalid MFT record magic: {rec.magic!r} (expected b'FILE')[/red]")
         raise typer.Exit(1)
 
-    hex_len = len(fixed) if full_dump else min(512, len(fixed))
-    header_fields: list[tuple[int, int, str, str]] = [
-        (0,  4, "Magic",             rec.magic.decode()),
-        (4,  2, "Update seq offset", str(rec.update_seq_offset)),
-        (6,  2, "Update seq size",   str(rec.update_seq_size)),
-        (8,  8, "Log file seq#",     str(rec.log_file_seq)),
-        (16, 2, "Sequence number",   str(rec.seq_number)),
-        (18, 2, "Hard link count",   str(rec.hard_link_count)),
-        (20, 2, "First attr offset", f"0x{rec.first_attr_offset:04X}"),
-        (22, 2, "Flags",             f"0x{rec.flags:04X}  ({rec.flag_names})"),
-        (24, 4, "Used size",         f"{rec.used_size} bytes"),
-        (28, 4, "Allocated size",    f"{rec.alloc_size} bytes"),
-        (32, 8, "Base record ref",   str(rec.base_record_ref)),
-        (40, 2, "Next attr ID",      str(rec.next_attr_id)),
-        (44, 4, "Record number",     str(rec.record_number)),
-    ]
-    render_hex_table(fixed[:hex_len], header_fields, title=title)
+    if not context.output_json:
+        hex_len = len(fixed) if full_dump else min(512, len(fixed))
+        header_fields: list[tuple[int, int, str, str]] = [
+            (0,  4, "Magic",             rec.magic.decode()),
+            (4,  2, "Update seq offset", str(rec.update_seq_offset)),
+            (6,  2, "Update seq size",   str(rec.update_seq_size)),
+            (8,  8, "Log file seq#",     str(rec.log_file_seq)),
+            (16, 2, "Sequence number",   str(rec.seq_number)),
+            (18, 2, "Hard link count",   str(rec.hard_link_count)),
+            (20, 2, "First attr offset", f"0x{rec.first_attr_offset:04X}"),
+            (22, 2, "Flags",             f"0x{rec.flags:04X}  ({rec.flag_names})"),
+            (24, 4, "Used size",         f"{rec.used_size} bytes"),
+            (28, 4, "Allocated size",    f"{rec.alloc_size} bytes"),
+            (32, 8, "Base record ref",   str(rec.base_record_ref)),
+            (40, 2, "Next attr ID",      str(rec.next_attr_id)),
+            (44, 4, "Record number",     str(rec.record_number)),
+        ]
+        render_hex_table(fixed[:hex_len], header_fields, title=title, console=console)
 
-    attr_table = Table(title="Attributes", box=box.ROUNDED, header_style="bold")
-    attr_table.add_column("ID", justify="right")
-    attr_table.add_column("Type")
-    attr_table.add_column("Offset", justify="right")
-    attr_table.add_column("Hdr (B)", justify="right")
-    attr_table.add_column("Data (B)", justify="right")
-    attr_table.add_column("Resident")
-    attr_table.add_column("Name")
+        attr_table = Table(title="Attributes", box=box.ROUNDED, header_style="bold")
+        attr_table.add_column("ID", justify="right")
+        attr_table.add_column("Type")
+        attr_table.add_column("Offset", justify="right")
+        attr_table.add_column("Hdr (B)", justify="right")
+        attr_table.add_column("Data (B)", justify="right")
+        attr_table.add_column("Resident")
+        attr_table.add_column("Name")
 
-    for attr in rec.attributes:
-        if attr.attr_type == 0xFFFFFFFF:
-            break
-        hdr_size = "24" if not attr.non_resident else "64"
-        data_size = str(len(attr.data)) if not attr.non_resident else "—"
-        attr_table.add_row(
-            str(attr.attr_id),
-            f"0x{attr.attr_type:02X}  {attr.attr_name}",
-            f"0x{attr.offset:04X}",
-            hdr_size,
-            data_size,
-            "No" if attr.non_resident else "Yes",
-            attr.name or "—",
-        )
-    console.print(attr_table)
+        for attr in rec.attributes:
+            if attr.attr_type == 0xFFFFFFFF:
+                break
+            hdr_size = "24" if not attr.non_resident else "64"
+            data_size = str(len(attr.data)) if not attr.non_resident else "—"
+            attr_table.add_row(
+                str(attr.attr_id),
+                f"0x{attr.attr_type:02X}  {attr.attr_name}",
+                f"0x{attr.offset:04X}",
+                hdr_size,
+                data_size,
+                "No" if attr.non_resident else "Yes",
+                attr.name or "—",
+            )
+        console.print(attr_table)
 
-    for attr in rec.attributes:
-        if attr.attr_type == 0xFFFFFFFF or not attr.decoded:
-            continue
-        detail = Table(title=f"{attr.attr_name} details", box=box.SIMPLE, header_style="bold")
-        detail.add_column("Field")
-        detail.add_column("Value")
-        for k, v in attr.decoded.items():
-            detail.add_row(k, v)
-        console.print(detail)
+        for attr in rec.attributes:
+            if attr.attr_type == 0xFFFFFFFF or not attr.decoded:
+                continue
+            detail = Table(title=f"{attr.attr_name} details", box=box.SIMPLE, header_style="bold")
+            detail.add_column("Field")
+            detail.add_column("Value")
+            for k, v in attr.decoded.items():
+                detail.add_row(k, v)
+            console.print(detail)
 
     return fixed, rec  # return for callers that need to do further work
 
@@ -265,6 +268,7 @@ def _stream_mft_from_image(image: Path, offset: int) -> Iterator[bytes]:
 
 def _read_mft_entry_from_image(image: Path, offset: int, entry_num: int) -> bytes:
     """Read a single MFT entry by streaming $MFT from an E01 image."""
+    console = context.get_console()
     proc = subprocess.Popen(
         ["icat", "-o", str(offset), str(image), "0"],
         stdout=subprocess.PIPE,
@@ -318,6 +322,8 @@ def record(
       --dump      Show the full 1 KB hex dump instead of just the first sector\\n
       --extract X Write file content to X  (resident always; non-resident needs --raw)
     """
+    console = context.get_console()
+
     # ── 1. Obtain the raw 1 KB record bytes ────────────────────────────────
     raw_vol: Path | None = None  # set when source is a raw volume file
 
@@ -339,7 +345,8 @@ def record(
             if entry is None:
                 console.print("[red]--entry is required with --raw.[/red]")
                 raise typer.Exit(1)
-            console.print(f"[dim]Scanning {file.name} for MFT entry #{entry}…[/dim]")
+            if not context.output_json:
+                console.print(f"[dim]Scanning {file.name} for MFT entry #{entry}…[/dim]")
             data = _find_entry_raw(file, entry)
             if data is None:
                 console.print(f"[red]Entry #{entry} not found in {file}.[/red]")
@@ -354,13 +361,51 @@ def record(
         console.print("[red]Provide a file argument or --image / --offset / --entry.[/red]")
         raise typer.Exit(1)
 
-    # ── 2. Display the record ───────────────────────────────────────────────
-    result = _display_record(data, title, full_dump=dump)
+    # ── 2. Parse the record ─────────────────────────────────────────────────
+    fixed = _apply_usa_fixup(data)
+    rec = mft_parser.parse(fixed)
+
+    if not rec.is_valid:
+        console.print(f"[red]Invalid MFT record magic: {rec.magic!r} (expected b'FILE')[/red]")
+        raise typer.Exit(1)
+
+    if context.output_json:
+        attrs = []
+        for attr in rec.attributes:
+            if attr.attr_type == 0xFFFFFFFF:
+                break
+            attrs.append({
+                "id": attr.attr_id,
+                "type": f"0x{attr.attr_type:02X}",
+                "name": attr.attr_name,
+                "offset": f"0x{attr.offset:04X}",
+                "resident": not attr.non_resident,
+                "hdr_size": 24 if not attr.non_resident else 64,
+                "data_size": len(attr.data) if not attr.non_resident else None,
+                "decoded": attr.decoded or {},
+            })
+        print(json.dumps({
+            "magic": rec.magic.decode(errors="replace"),
+            "seq_number": rec.seq_number,
+            "hard_link_count": rec.hard_link_count,
+            "flags": f"0x{rec.flags:04X}",
+            "flag_names": rec.flag_names,
+            "is_directory": rec.is_directory,
+            "is_in_use": rec.is_in_use,
+            "record_number": rec.record_number,
+            "used_size": rec.used_size,
+            "alloc_size": rec.alloc_size,
+            "attributes": attrs,
+        }, indent=2))
+        return
+
+    # ── 3. Display the record ───────────────────────────────────────────────
+    result = _display_record(data, title, full_dump=dump, console=console)
     if result is None:
         raise typer.Exit(1)
     fixed, rec = result
 
-    # ── 3. Extract $DATA if requested ──────────────────────────────────────
+    # ── 4. Extract $DATA if requested ──────────────────────────────────────
     if extract is not None:
         data_attrs = [a for a in rec.attributes if a.attr_type == 0x80]
         if not data_attrs:
@@ -386,7 +431,6 @@ def record(
 
         extract.write_bytes(content)
 
-        # Show info about the non-resident layout for educational purposes
         if attr.non_resident:
             a = attr.offset
             run_off_rel = struct.unpack_from("<H", fixed, a + 0x20)[0]
@@ -413,9 +457,7 @@ def record(
             except Exception:
                 pass
 
-        console.print(
-            f"[green]✓ Extracted {len(content):,} bytes → {extract}[/green]"
-        )
+        console.print(f"[green]✓ Extracted {len(content):,} bytes → {extract}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -441,11 +483,14 @@ def scan(
       mft scan --image disk.E01 --offset 128  Stream $MFT from an E01 image\\n
       mft scan --raw recovered.bin            Raw volume scan (bypass broken MFT index)
     """
+    console = context.get_console()
+
     if image is not None:
         if offset is None:
             console.print("[red]--offset is required with --image.[/red]")
             raise typer.Exit(1)
-        console.print(f"[dim]Streaming $MFT from {image.name} at offset {offset}…[/dim]")
+        if not context.output_json:
+            console.print(f"[dim]Streaming $MFT from {image.name} at offset {offset}…[/dim]")
         source = _stream_mft_from_image(image, offset)
         source_name = f"{image.name} (offset {offset})"
     elif file is not None:
@@ -453,11 +498,13 @@ def scan(
             console.print(f"[red]File not found: {file}[/red]")
             raise typer.Exit(1)
         if raw:
-            console.print(f"[dim]Raw volume scan of {file.name} "
-                          "(FILE records at 512-byte boundaries)…[/dim]")
+            if not context.output_json:
+                console.print(f"[dim]Raw volume scan of {file.name} "
+                              "(FILE records at 512-byte boundaries)…[/dim]")
             source = _iter_raw_volume(file)
         else:
-            console.print(f"[dim]Scanning $MFT dump: {file.name}[/dim]")
+            if not context.output_json:
+                console.print(f"[dim]Scanning $MFT dump: {file.name}[/dim]")
             source = _iter_file(file)
         source_name = file.name
     else:
@@ -480,6 +527,7 @@ def scan(
     count = 0
     shown = 0
     csv_rows: list[list[str]] = []
+    json_rows: list[dict] = []
 
     for chunk in source:
         if len(chunk) < 48 or chunk[:4] != b"FILE":
@@ -511,14 +559,29 @@ def scan(
                 d.get("Modified", "?"),
                 d.get("Real size", "?"),
             ]
-            table.add_row(*row)
+            if not context.output_json:
+                table.add_row(*row)
             if csv_out is not None:
                 csv_rows.append(row)
+            if context.output_json:
+                json_rows.append({
+                    "mft_num": row[0],
+                    "filename": row[1],
+                    "parent_mft": row[2],
+                    "type": row[3],
+                    "created": row[4],
+                    "modified": row[5],
+                    "size": row[6],
+                })
             shown += 1
             break
         count += 1
         if limit and shown >= limit:
             break
+
+    if context.output_json:
+        print(json.dumps(json_rows, indent=2))
+        return
 
     console.print(table)
     mode = "(raw volume scan)" if raw else ""
