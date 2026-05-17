@@ -228,16 +228,96 @@ def _display_record(data: bytes, title: str, full_dump: bool = False, console=No
         console.print(attr_table)
 
         for attr in rec.attributes:
-            if attr.attr_type == 0xFFFFFFFF or not attr.decoded:
+            if attr.attr_type == 0xFFFFFFFF:
                 continue
-            detail = Table(title=f"{attr.attr_name} details", box=box.SIMPLE, header_style="bold")
-            detail.add_column("Field")
-            detail.add_column("Value")
-            for k, v in attr.decoded.items():
-                detail.add_row(k, v)
-            console.print(detail)
+            label = f"{attr.attr_name} details" + (f" ({attr.name})" if attr.name else "")
+
+            # $ATTRIBUTE_LIST → list of entries
+            if attr.attribute_list:
+                t = Table(title=label, box=box.SIMPLE, header_style="bold")
+                for col in ("Type", "Length", "Start VCN", "MFT ref", "Attr ID", "Name"):
+                    t.add_column(col)
+                for e in attr.attribute_list:
+                    t.add_row(e["Type"], e["Length"], e["Start VCN"],
+                              e["MFT ref"], e["Attr ID"], e["Name"])
+                console.print(t)
+                continue
+
+            # $INDEX_ROOT → header + entries
+            if attr.index_root is not None:
+                _print_index_root(label, attr.index_root, console)
+                continue
+
+            # Non-resident attribute → data runs summary
+            if attr.non_resident and attr.runs:
+                rt = Table(title=label + " (non-resident)", box=box.SIMPLE, header_style="bold")
+                rt.add_column("Field"); rt.add_column("Value")
+                rt.add_row("Start VCN",      str(attr.start_vcn))
+                rt.add_row("Last VCN",       str(attr.last_vcn))
+                rt.add_row("Allocated size", f"{attr.allocated_size:,} bytes")
+                rt.add_row("Real size",      f"{attr.real_size:,} bytes")
+                rt.add_row("Initialised",    f"{attr.initialised_size:,} bytes")
+                if attr.flags & 0x0001:
+                    rt.add_row("Compressed size", f"{attr.compressed_size:,} bytes")
+                console.print(rt)
+
+                rrt = Table(title=label + " — Data Runs", box=box.SIMPLE, header_style="bold")
+                for col in ("#", "Header", "LCN", "Clusters"):
+                    rrt.add_column(col, justify="right" if col != "Header" else "left")
+                for i, run in enumerate(attr.runs):
+                    rrt.add_row(str(i), f"0x{run.header:02X}",
+                                "sparse" if run.is_sparse else str(run.lcn),
+                                str(run.length))
+                console.print(rrt)
+                continue
+
+            # Generic dict decoders
+            if attr.decoded:
+                detail = Table(title=label, box=box.SIMPLE, header_style="bold")
+                detail.add_column("Field")
+                detail.add_column("Value")
+                for k, v in attr.decoded.items():
+                    detail.add_row(k, v)
+                console.print(detail)
 
     return fixed, rec  # return for callers that need to do further work
+
+
+def _print_index_root(label: str, root, console) -> None:
+    """Render an $INDEX_ROOT body (header + B+Tree entries)."""
+    from ifn.parsers import ntfs_attributes as _na
+    meta = Table(title=label, box=box.SIMPLE, header_style="bold")
+    meta.add_column("Field"); meta.add_column("Value")
+    meta.add_row("Indexed attribute",   f"0x{root.attribute_type:02X}  "
+                                         f"{_na.ATTR_NAMES.get(root.attribute_type, '?')}")
+    meta.add_row("Collation rule",      str(root.collation_rule))
+    meta.add_row("Index buffer size",   f"{root.index_buffer_size} B")
+    meta.add_row("Clusters per buffer", str(root.clusters_per_buffer))
+    meta.add_row("Has sub-nodes",       "Yes" if root.header.has_subnodes else "No")
+    meta.add_row("Entries area",        f"{root.header.entries_size} B "
+                                         f"(allocated {root.header.allocated_size} B)")
+    console.print(meta)
+
+    if not root.entries:
+        return
+    et = Table(title=label + " — entries", box=box.SIMPLE, header_style="bold")
+    for col in ("MFT#", "Flags", "Filename", "Namespace", "Real size"):
+        et.add_column(col)
+    for e in root.entries:
+        if e.is_last:
+            et.add_row("—", "LAST", "", "", "")
+            continue
+        d = e.decoded_filename()
+        flags = []
+        if e.has_subnode: flags.append(f"→VCN {e.child_vcn}")
+        et.add_row(
+            str(e.mft_ref & 0xFFFFFFFFFFFF),
+            ", ".join(flags) or "leaf",
+            d.get("Filename", "?"),
+            d.get("Namespace", "?"),
+            d.get("Real size", "?"),
+        )
+    console.print(et)
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +390,9 @@ def record(
     dump: bool             = typer.Option(False, "--dump", help="Show the full 1 KB hex dump (default: first 512 B)"),
     extract: Optional[Path] = typer.Option(None, "--extract", "-x",
                                             help="Write $DATA content to this path (requires --raw for non-resident data)"),
+    stream: Optional[str] = typer.Option(None, "--stream",
+                                          help="Name of the $DATA stream to extract (default: unnamed). "
+                                               "Use to pull an alternate data stream like 'Zone.Identifier'."),
 ):
     """Parse a single MFT record: header, attributes, and decoded fields.
 
@@ -412,7 +495,18 @@ def record(
             console.print("[yellow]No $DATA attribute found in this record.[/yellow]")
             raise typer.Exit(1)
 
-        attr = data_attrs[0]
+        if stream is None:
+            attr = next((a for a in data_attrs if a.name == ""), None)
+            stream_label = "unnamed $DATA"
+        else:
+            attr = next((a for a in data_attrs if a.name == stream), None)
+            stream_label = f"$DATA:{stream}"
+
+        if attr is None:
+            names = [a.name or "<unnamed>" for a in data_attrs]
+            console.print(f"[red]{stream_label} not found. Available streams: "
+                          f"{', '.join(names)}[/red]")
+            raise typer.Exit(1)
 
         if attr.non_resident and raw_vol is None:
             console.print(
@@ -422,7 +516,7 @@ def record(
             )
             raise typer.Exit(1)
 
-        console.print(f"[dim]Extracting $DATA → {extract}…[/dim]")
+        console.print(f"[dim]Extracting {stream_label} → {extract}…[/dim]")
         try:
             content = _extract_file_data(raw_vol or file, fixed, attr)
         except (OSError, RuntimeError) as e:
