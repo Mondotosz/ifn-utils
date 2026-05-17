@@ -1,6 +1,6 @@
 import typer
 
-from ifn.cli import deps, fv, hives, image, lnk, mft, partitions, time, trash, vbr
+from ifn.cli import deps, fv, hives, image, index, lnk, mft, partitions, time, trash, vbr
 
 app = typer.Typer(name="tool", help="HEIG-VD IFN forensics toolkit")
 app.add_typer(partitions.app, name="partitions")
@@ -8,6 +8,7 @@ app.add_typer(vbr.app, name="vbr")
 app.add_typer(lnk.app, name="lnk")
 app.add_typer(trash.app, name="trash")
 app.add_typer(mft.app, name="mft")
+app.add_typer(index.app, name="index")
 app.add_typer(hives.app, name="hives")
 app.add_typer(fv.app, name="fv")
 app.add_typer(image.app, name="image")
