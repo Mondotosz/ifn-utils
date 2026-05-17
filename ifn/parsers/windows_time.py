@@ -97,6 +97,13 @@ def filetime_to_datetime(ticks: int) -> datetime:
     return _FILETIME_EPOCH + timedelta(microseconds=ticks // 10)
 
 
+def fmt_filetime(ticks: int) -> str:
+    """Format a FILETIME as a printable UTC string, '—' if zero."""
+    if ticks == 0:
+        return "—"
+    return filetime_to_datetime(ticks).strftime("%Y-%m-%d %H:%M:%S.%f UTC")
+
+
 def unix_to_datetime(ts: int) -> datetime:
     """Convert a Unix timestamp (seconds since 1970-01-01) to a UTC datetime."""
     return _UNIX_EPOCH + timedelta(seconds=ts)
