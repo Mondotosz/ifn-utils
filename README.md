@@ -204,14 +204,33 @@ size (with the `2^(-N)` formula applied), the 64-bit volume serial, and the
 `0x55AA` signature.
 
 ```fish
-# Read the VBR from an offset inside a larger dump (eg a raw partition):
-uv run tool.py vbr ntfs exhibits/image/partition.bin --offset 0
+# Read the VBR from a raw disk image at the partition's sector offset:
+uv run tool.py vbr ntfs ewf/ewf1 --offset 128
 ```
 
 JSON output for piping into `jq`:
 
 ```fish
 uv run tool.py --json vbr ntfs ntfs_vbr.bin | jq '.mft_offset_bytes'
+```
+
+Use `--scan` to find and fully decode **every** NTFS VBR in a file — works
+with both a mounted raw image and an `.E01` file (auto-mounted internally):
+
+```fish
+# Scan a raw block device (e.g. a mounted EWF)
+uv run tool.py vbr ntfs ewf/ewf1 --scan
+
+# Scan directly from an E01 image (ewfmount is called automatically)
+uv run tool.py vbr ntfs exhibits/images/disk.E01 --scan
+```
+
+Each VBR found is printed with its sector number as the title, followed by
+the full annotated hex table and field breakdown — identical to the single-VBR
+output.  JSON mode emits a list where each object has an extra `sector` key:
+
+```fish
+uv run tool.py --json vbr ntfs ewf/ewf1 --scan | jq '.[].hidden_sectors'
 ```
 
 ---
@@ -504,6 +523,27 @@ uv run tool.py mft scan exhibits/mft/mft.bin --limit 50
 uv run tool.py mft scan exhibits/mft/mft.bin --deleted   # include deleted entries
 ```
 
+Use `--skip` to jump past early entries without accumulating them in the output
+table (useful when the entry of interest is deep in a large MFT):
+
+```fish
+# Show entries 5000–5009 only
+uv run tool.py mft scan exhibits/mft/mft.bin --skip 5000 --limit 10
+```
+
+When working with a **raw mounted EWF** (e.g. `ewf/ewf1`) that contains
+multiple partitions, use `--offset` (sectors) to start at the right partition
+and `--sectors` to prevent bleeding into adjacent partitions:
+
+```fish
+# Scan only the first NTFS partition (starts at sector 128, size 4194304 sectors)
+uv run tool.py mft scan ewf/ewf1 --offset 128 --sectors 4194304
+# Combined: jump to entry 5000 within that partition
+uv run tool.py mft scan ewf/ewf1 --offset 128 --sectors 4194304 --skip 5000 --limit 10
+```
+
+Both `--offset` / `--sectors` also work with `--raw` (FILE-signature scan mode).
+
 ```text
                                               MFT Scan — mft.bin
 ╭──────┬──────────────┬─────────┬──────┬─────────────────────────┬─────────────────────────┬──────────────────╮
@@ -576,6 +616,15 @@ The `mft record` command also decodes:
   runs flagged).
 
 ### Alternate Data Streams (ADS)
+
+When a raw image contains **multiple partitions**, pass `--offset` to start
+scanning from the correct partition so `--entry` finds the right record instead
+of the first match in an earlier partition:
+
+```fish
+# Entry 57 in the second partition (sector offset 2097279), not the first
+uv run tool.py mft record --raw ewf/ewf1 --offset 2097279 --entry 57
+```
 
 To extract a *named* `$DATA` stream (eg `Zone.Identifier`) instead of the
 file's main content, use `--stream`:
@@ -1065,10 +1114,13 @@ uv run tool.py image lock bitlocker_partition mnt/ /dev/loop0 ewf/
 
 ### NTFS partition recovery
 
-Find deleted/broken NTFS partitions using the VBR
+Find deleted/broken NTFS partitions using the VBR. Both `vbr-scan` and
+`recover-partition` accept either an `.E01` image (mounted automatically via
+`ewfmount`) or a raw block device such as a mounted EWF:
 
 ```fish
-uv run tool.py image vbr-scan exhibits/image/disk.E01
+uv run tool.py image vbr-scan exhibits/images/disk.E01
+uv run tool.py image vbr-scan ewf/ewf1   # raw device, no ewfmount needed
 ```
 
 ```text
@@ -1098,6 +1150,14 @@ Scan complete: 5 VBR signature(s) found.
 ```
 
 If a broken partition is found you can recover it with the provided command.
+The same command works with a raw device directly:
+
+```fish
+# From E01
+uv run tool.py image recover-partition exhibits/images/disk.E01 4188286 --output recovered.bin
+# From raw mounted EWF
+uv run tool.py image recover-partition ewf/ewf1 4188286 --output recovered.bin
+```
 
 > [!NOTE] The recovered partition might be broken. In this example, the primary
 > VBR as well as \$MFT and \$MFTMirr were overwritten.
