@@ -954,7 +954,7 @@ _VBR_SCAN_HEADERS = ["Sector", "Role", "FS", "Part start", "Total sectors", "Bac
 
 @app.command()
 def vbr_scan(
-    file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
+    file: Path = typer.Argument(..., help="Path to .E01 image or raw disk file", exists=True),
     csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export VBR scan results to CSV"),
 ) -> None:
     """Scan all sectors for VBR signatures and identify primary, backup, and broken partitions."""
@@ -969,9 +969,17 @@ def vbr_scan(
     if not context.output_json:
         console.print(f"[dim]Partition table: {len(known_starts)} partition(s) at sectors "
                       f"{sorted(known_starts)}[/dim]")
-        console.print("[dim]Mounting image and scanning for VBR signatures…[/dim]")
 
-    tmpdir, ewf1 = _ewfmount_temp(file)
+    is_ewf = file.suffix.upper() in {".E01", ".E02", ".EWF"}
+    if is_ewf:
+        if not context.output_json:
+            console.print("[dim]Mounting image and scanning for VBR signatures…[/dim]")
+        tmpdir, ewf1 = _ewfmount_temp(file)
+    else:
+        if not context.output_json:
+            console.print("[dim]Scanning for VBR signatures…[/dim]")
+        tmpdir, ewf1 = None, file
+
     try:
         vbrs = _scan_vbr_signatures(ewf1)
         vbr_map: dict[int, bytes] = {sec: data for sec, data in vbrs}
@@ -1078,7 +1086,8 @@ def vbr_scan(
             console.print("[green]No broken partitions detected.[/green]")
 
     finally:
-        _ewfumount(tmpdir)
+        if is_ewf:
+            _ewfumount(tmpdir)
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +1096,7 @@ def vbr_scan(
 
 @app.command()
 def recover_partition(
-    file: Path = typer.Argument(..., help="Path to .E01 image", exists=True),
+    file: Path = typer.Argument(..., help="Path to .E01 image or raw disk file", exists=True),
     backup_sector: int = typer.Argument(..., help="Sector number of the intact backup VBR"),
     output: Path = typer.Option(..., "--output", "-o", help="Output file for the recovered raw partition"),
 ):
@@ -1097,7 +1106,11 @@ def recover_partition(
     backup VBR (last sector) to sector 0, making the partition readable again.
     """
     console = context.get_console()
-    tmpdir, ewf1 = _ewfmount_temp(file)
+    is_ewf = file.suffix.upper() in {".E01", ".E02", ".EWF"}
+    if is_ewf:
+        tmpdir, ewf1 = _ewfmount_temp(file)
+    else:
+        tmpdir, ewf1 = None, file
     try:
         vbr_data = _read_sector(ewf1, backup_sector)
         if vbr_data[3:11] != _NTFS_OEM:
@@ -1157,7 +1170,8 @@ def recover_partition(
             f"[dim]  Standard tools: fls -f ntfs {output}[/dim]"
         )
     finally:
-        _ewfumount(tmpdir)
+        if is_ewf:
+            _ewfumount(tmpdir)
 
 
 def _write_csv(path: Optional[Path], headers: list[str], rows: list[list[str]], console) -> None:
