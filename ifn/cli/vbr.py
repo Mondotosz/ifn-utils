@@ -87,12 +87,12 @@ def ntfs(
     file: Path = typer.Argument(..., help="Path to a 512-byte NTFS VBR dump (or larger file)",
                                  exists=True),
     offset: int = typer.Option(0, "--offset", "-o",
-                                help="Byte offset into FILE to read the VBR from"),
+                                help="Partition start in sectors (e.g. 128 → seeks to byte 65536)"),
 ) -> None:
     """Parse an NTFS Volume Boot Record (jump code, BPB, $MFT/$MFTMirr LCN, serial, …)."""
     console = context.get_console()
     with file.open("rb") as f:
-        f.seek(offset)
+        f.seek(offset * 512)
         data = f.read(512)
     if len(data) < 512:
         console.print(f"[red]Could not read 512 bytes at offset {offset}.[/red]")
