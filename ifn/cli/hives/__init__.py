@@ -11,6 +11,7 @@ from rich import box
 from Registry import Registry
 
 from ifn import context
+from ifn.display.hex_table import render_hex_table
 
 app = typer.Typer(help="Parse Windows Registry hive files")
 
@@ -244,14 +245,29 @@ def get(
         }, indent=2))
         return
 
-    console.print(Panel(
-        f"[bold]Key:[/bold]   {path}\n"
-        f"[bold]Value:[/bold] {val.name() or '(Default)'}\n"
-        f"[bold]Type:[/bold]  {vtype}\n"
-        f"[bold]Data:[/bold]  {data_str}",
-        title="Registry Value",
-        border_style="green",
-    ))
+    if isinstance(raw, bytes):
+        vname = val.name() or "(Default)"
+        console.print(
+            f"[bold]Key:[/bold] {path}  [dim]│[/dim]  "
+            f"[bold]Value:[/bold] {vname}  [dim]│[/dim]  "
+            f"[bold]Type:[/bold] {vtype}  [dim]│[/dim]  "
+            f"[bold]Length:[/bold] {len(raw)} bytes"
+        )
+        render_hex_table(
+            raw,
+            [(0, len(raw), "Data", f"{vtype}  {len(raw)} bytes")],
+            title=f"{vname} ({vtype})",
+            console=console,
+        )
+    else:
+        console.print(Panel(
+            f"[bold]Key:[/bold]   {path}\n"
+            f"[bold]Value:[/bold] {val.name() or '(Default)'}\n"
+            f"[bold]Type:[/bold]  {vtype}\n"
+            f"[bold]Data:[/bold]  {data_str}",
+            title="Registry Value",
+            border_style="green",
+        ))
 
     if dump is not None:
         if not isinstance(raw, bytes):

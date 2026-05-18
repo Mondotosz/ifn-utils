@@ -665,6 +665,7 @@ visible via `vbr ntfs <vbr>` in the *Index buffer size* row). Truncated lab
 exhibits smaller than `--size` are parsed as a single buffer.
 
 JSON output:
+
 ```fish
 uv run tool.py --json index indx INDEX_ALLOCATION.bin --size 4096 \
     | jq '.[0].entries[] | select(.filename != null) | .filename'
@@ -759,6 +760,93 @@ uv run tool.py hives get exhibits/hives/NTUSER.DAT \
 │ Data:  "C:\Program Files\Microsoft                      │
 │ OneDrive\OneDrive.exe" /background                      │
 ╰─────────────────────────────────────────────────────────╯
+```
+
+`REG_BINARY` values are rendered as a hex table instead of a flat hex string:
+
+```fish
+uv run tool.py hives get exhibits/hives/SYSTEM 'MountedDevices' '\DosDevices\F:'
+```
+
+```text
+Key: MountedDevices  │  Value: \DosDevices\F:  │  Type: RegBin  │  Length: 110 bytes
+─────────────────────────────── \DosDevices\F: (RegBin) ────────────────────────────
+╭────────────────────── Hex Dump ──────────────────────╮ ╭──── Fields ─────────────────────────────────────────╮
+│ 00000000  7B 00 64 00 35 00 66 00  64 00 64 00 35 00 │ │  Offset   Len   Field   Raw (hex)       Value       │
+│ 30 00 |{.d.5.f.d.d.5.0.|                            │ │ ─────────────────────────────────────────────────── │
+│ ...                                                  │ │  0x0000   110   Data    7B 00 64 00 …   RegBin      │
+│                                                      │ │                                         110 bytes   │
+╰──────────────────────────────────────────────────────╯ ╰─────────────────────────────────────────────────────╯
+```
+
+Use `--dump` to save the raw bytes to a file for further parsing:
+
+```fish
+uv run tool.py hives get exhibits/hives/SYSTEM 'MountedDevices' '\DosDevices\F:' \
+  --dump exhibits/hives/device.bin
+```
+
+### hives system mounted-devices-bin
+
+Parse a previously dumped `MountedDevices` binary value. Handles four formats
+automatically: DMIO dynamic disk, MBR partition (12 bytes), GPT partition GUID
+(16 bytes), and UTF-16LE GUID string (`{DiskGUID}#PartitionByteOffset`).
+
+**DMIO dynamic disk** (e.g. `\DosDevices\C:` on a system drive):
+
+```fish
+uv run tool.py hives system mounted-devices-bin exhibits/hives/device.C.bin
+```
+
+```text
+─────────────────── MountedDevices — DMIO:ID: — device.C.bin ───────────────────
+╭────────────────────── Hex Dump ──────────────────────╮ ╭──── Fields ─────────────────────────────────────────────────────────╮
+│ 00000000  44 4D 49 4F 3A 49 44 3A  A4 59 5D C4 AA CA │ │  Offset   Len   Field             Raw (hex)       Value            │
+│ B9 4B |DMIO:ID:.Y]....K|                             │ │ ─────────────────────────────────────────────────────────────────  │
+│ 00000010  A2 D2 29 7D FA A9 FB 55  |..)}...U|        │ │  0x0000     8   Magic             44 4D 49 4F …   DMIO:ID:         │
+│                                                      │ │                                                    (LDM dynamic    │
+╰──────────────────────────────────────────────────────╯ │                                                    disk)           │
+                                                         │  0x0008     4   GUID Data1 (LE)   A4 59 5D C4     0xC45D59A4       │
+                                                         │  0x000C     2   GUID Data2 (LE)   AA CA           0xCAAA           │
+                                                         │  0x000E     2   GUID Data3 (LE)   B9 4B           0x4BB9           │
+                                                         │  0x0010     8   GUID Data4 (BE)   A2 D2 29 7D …   A2 D2 29 7D …   │
+                                                         ╰─────────────────────────────────────────────────────────────────────╯
+
+  Volume identifier GUID:  {C45D59A4-CAAA-4BB9-A2D2-297DFAA9FB55}
+```
+
+**UTF-16LE GUID string** (e.g. `\DosDevices\F:` on a removable drive):
+
+```fish
+uv run tool.py hives system mounted-devices-bin exhibits/hives/device.bin
+```
+
+```text
+────────────────── MountedDevices — GUID String — device.bin ───────────────────
+╭─────── Hex Dump ───────╮ ╭──── Fields ─────────────────────────────────────────────────────────────────────────────╮
+│ 00000000  7B 00 64 00  │ │  Offset   Len   Field                    Raw (hex)        Value                         │
+│ ...                    │ │ ────────────────────────────────────────────────────────────────────────────────────── │
+╰────────────────────────╯ │  0x0000    76   Disk GUID (UTF-16LE)     7B 00 64 00 …    {d5fdd503-f775-11ef-…         │
+                           │  0x004C     2   Separator                23 00            #                             │
+                           │  0x004E    32   Partition byte offset    30 00 30 00 …    0x0000000080010000            │
+                           │                 (hex string)                              → 2,147,549,184 bytes         │
+                           │                                                           (sector 4,194,432, 2048.1 MiB)│
+                           ╰─────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+JSON output:
+
+```fish
+uv run tool.py --json hives system mounted-devices-bin exhibits/hives/device.bin
+```
+
+```json
+{
+  "type": "guid_string",
+  "disk_guid": "{d5fdd503-f775-11ef-9dc0-806e6f6e6963}",
+  "partition_byte_offset": 2147549184,
+  "partition_sector_offset": 4194432
+}
 ```
 
 ---

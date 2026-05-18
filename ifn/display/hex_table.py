@@ -8,6 +8,7 @@ Usage:
 fields is a list of (offset, length, field_name, interpreted_value) tuples.
 Offset and length are byte positions within `data`.
 """
+
 from __future__ import annotations
 
 from rich.columns import Columns
@@ -18,12 +19,20 @@ from rich.text import Text
 from rich import box
 
 _HIGHLIGHT_COLORS = [
-    "bold cyan", "bold yellow", "bold green", "bold magenta",
-    "bold blue", "bold red", "bold white", "bold dark_orange",
+    "bold cyan",
+    "bold yellow",
+    "bold green",
+    "bold magenta",
+    "bold blue",
+    "bold red",
+    "bold white",
+    "bold dark_orange",
 ]
 
 
-def _hex_dump(data: bytes, fields: list[tuple[int, int, str, str]], width: int = 16) -> Text:
+def _hex_dump(
+    data: bytes, fields: list[tuple[int, int, str, str]], width: int = 16
+) -> Text:
     """Build a coloured hex dump Text where each field region gets its own colour."""
     offset_map: dict[int, int] = {}
     for idx, (off, length, _, _) in enumerate(fields):
@@ -32,11 +41,13 @@ def _hex_dump(data: bytes, fields: list[tuple[int, int, str, str]], width: int =
 
     text = Text()
     for row_start in range(0, len(data), width):
-        chunk = data[row_start: row_start + width]
+        chunk = data[row_start : row_start + width]
         text.append(f"{row_start:08X}  ", style="dim")
         for i, byte in enumerate(chunk):
             pos = row_start + i
-            color = _HIGHLIGHT_COLORS[offset_map[pos]] if pos in offset_map else "default"
+            color = (
+                _HIGHLIGHT_COLORS[offset_map[pos]] if pos in offset_map else "default"
+            )
             text.append(f"{byte:02X}", style=color)
             text.append(" " if i != 7 else "  ")
         # Pad incomplete last row
@@ -60,7 +71,7 @@ def render_hex_table(
 ) -> None:
     """Render a hex dump panel alongside an annotated field table."""
     if console is None:
-        console = Console()
+        console = Console(emoji=False)
 
     hex_text = _hex_dump(data, fields)
     hex_panel = Panel(hex_text, title="Hex Dump", border_style="dim", padding=(0, 1))
@@ -74,17 +85,17 @@ def render_hex_table(
 
     for idx, (off, length, name, value) in enumerate(fields):
         color = _HIGHLIGHT_COLORS[idx % len(_HIGHLIGHT_COLORS)]
-        raw = data[off: off + length].hex(" ").upper()
+        raw = data[off : off + length].hex(" ").upper()
         field_table.add_row(
             f"0x{off:04X}",
             str(length),
             Text(name, style=color),
-            raw,
-            value,
+            Text(raw),
+            Text(value),
         )
 
     field_panel = Panel(field_table, title="Fields", border_style="dim", padding=(0, 1))
 
     if title:
-        console.rule(f"[bold]{title}[/bold]")
+        console.rule(Text(title, style="bold"))
     console.print(Columns([hex_panel, field_panel], equal=False, expand=True))
