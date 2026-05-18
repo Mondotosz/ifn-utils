@@ -567,6 +567,7 @@ def scan(
                               help="Raw volume scan: find FILE records at 512-byte boundaries "
                                    "(bypasses MFT index; use for broken partitions)"),
     limit: int = typer.Option(0, "--limit", "-n", help="Stop after N records (0 = all)"),
+    skip: int = typer.Option(0, "--skip", "-s", help="Skip the first N matched records before showing"),
     show_deleted: bool = typer.Option(False, "--deleted", help="Include deleted (not in use) records"),
     csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export results to a CSV file"),
 ):
@@ -620,6 +621,7 @@ def scan(
 
     count = 0
     shown = 0
+    skipped = 0
     csv_rows: list[list[str]] = []
     json_rows: list[dict] = []
 
@@ -644,6 +646,9 @@ def scan(
             d = fn_attr.decoded
             if not d:
                 continue
+            if skip and skipped < skip:
+                skipped += 1
+                break
             row = [
                 str(rec.record_number or count),
                 d.get("Filename", "?"),
