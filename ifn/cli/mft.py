@@ -146,11 +146,13 @@ def _extract_file_data(
 # Raw volume helpers
 # ---------------------------------------------------------------------------
 
-def _find_entry_raw(vol: Path, entry_num: int) -> bytes | None:
+def _find_entry_raw(vol: Path, entry_num: int, offset_sectors: int = 0) -> bytes | None:
     """Scan a raw NTFS volume at 512-byte boundaries for a FILE record with the given entry number."""
     CHUNK = 1024 * 1024
     buf = bytearray()
     with open(vol, "rb") as f:
+        if offset_sectors:
+            f.seek(offset_sectors * 512)
         while True:
             chunk = f.read(CHUNK)
             if not chunk:
@@ -384,7 +386,7 @@ def record(
         help="Raw 1 KB MFT record dump  OR  raw NTFS volume (when --raw is set)",
     ),
     image: Optional[Path]  = typer.Option(None, "--image", "-i", help="E01 image"),
-    offset: Optional[int]  = typer.Option(None, "--offset", "-o", help="Partition start sector (for --image)"),
+    offset: Optional[int]  = typer.Option(None, "--offset", "-o", help="Partition start in sectors (for --image or --raw)"),
     entry: Optional[int]   = typer.Option(None, "--entry", "-e", help="MFT entry number (required for --image / --raw)"),
     raw: bool              = typer.Option(False, "--raw", help="Treat FILE as a raw NTFS volume and scan for --entry"),
     dump: bool             = typer.Option(False, "--dump", help="Show the full 1 KB hex dump (default: first 512 B)"),
@@ -430,7 +432,7 @@ def record(
                 raise typer.Exit(1)
             if not context.output_json:
                 console.print(f"[dim]Scanning {file.name} for MFT entry #{entry}…[/dim]")
-            data = _find_entry_raw(file, entry)
+            data = _find_entry_raw(file, entry, offset_sectors=offset or 0)
             if data is None:
                 console.print(f"[red]Entry #{entry} not found in {file}.[/red]")
                 raise typer.Exit(1)
@@ -562,7 +564,8 @@ def record(
 def scan(
     file: Optional[Path] = typer.Argument(None, help="$MFT dump file, or raw NTFS volume (with --raw)"),
     image: Optional[Path] = typer.Option(None, "--image", "-i", help="E01 image — streams $MFT via icat"),
-    offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start sector (for --image)"),
+    offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start in sectors (for --image or file-based scanning)"),
+    sectors: int = typer.Option(0, "--sectors", help="Read at most N sectors from the file (0 = all; file-based only)"),
     raw: bool = typer.Option(False, "--raw",
                               help="Raw volume scan: find FILE records at 512-byte boundaries "
                                    "(bypasses MFT index; use for broken partitions)"),
@@ -596,11 +599,11 @@ def scan(
             if not context.output_json:
                 console.print(f"[dim]Raw volume scan of {file.name} "
                               "(FILE records at 512-byte boundaries)…[/dim]")
-            source = _iter_raw_volume(file)
+            source = _iter_raw_volume(file, offset_sectors=offset or 0, max_sectors=sectors)
         else:
             if not context.output_json:
                 console.print(f"[dim]Scanning $MFT dump: {file.name}[/dim]")
-            source = _iter_file(file)
+            source = _iter_file(file, offset_sectors=offset or 0, max_sectors=sectors)
         source_name = file.name
     else:
         console.print("[red]Provide a file argument or --image / --offset.[/red]")
@@ -698,24 +701,44 @@ def scan(
 # Internal iterators
 # ---------------------------------------------------------------------------
 
-def _iter_file(path: Path) -> Iterator[bytes]:
+def _iter_file(path: Path, offset_sectors: int = 0, max_sectors: int = 0) -> Iterator[bytes]:
     with path.open("rb") as f:
+        if offset_sectors:
+            f.seek(offset_sectors * 512)
+        remaining = max_sectors * 512 if max_sectors else None
         while True:
-            chunk = f.read(_RECORD_SIZE)
+            to_read = _RECORD_SIZE
+            if remaining is not None:
+                to_read = min(to_read, remaining)
+                if to_read <= 0:
+                    break
+            chunk = f.read(to_read)
             if not chunk:
                 break
+            if remaining is not None:
+                remaining -= len(chunk)
             yield chunk
 
 
-def _iter_raw_volume(path: Path) -> Iterator[bytes]:
+def _iter_raw_volume(path: Path, offset_sectors: int = 0, max_sectors: int = 0) -> Iterator[bytes]:
     """Scan a raw volume for FILE records at 512-byte boundaries."""
     CHUNK = 1024 * 1024
     buf = bytearray()
+    remaining = max_sectors * 512 if max_sectors else None
     with open(path, "rb") as f:
+        if offset_sectors:
+            f.seek(offset_sectors * 512)
         while True:
-            chunk = f.read(CHUNK)
+            to_read = CHUNK
+            if remaining is not None:
+                to_read = min(to_read, remaining)
+                if to_read <= 0:
+                    break
+            chunk = f.read(to_read)
             if not chunk:
                 break
+            if remaining is not None:
+                remaining -= len(chunk)
             buf.extend(chunk)
             i = 0
             while i + _RECORD_SIZE <= len(buf):
