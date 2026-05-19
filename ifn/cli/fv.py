@@ -239,9 +239,19 @@ def account(
     pw_change_str = "Must change at next logon" if f["pw_must_change"] else _ft(f["last_pw_change"])
     username = v["username"] or f"RID {effective_rid}"
 
+    # Detect mismatched F/V pair by comparing RIDs
+    v_sid = extract_sid_from_v_blob(v_data)
+    v_rid: int | None = None
+    if v_sid:
+        try:
+            v_rid = int(v_sid.rsplit("-", 1)[-1])
+        except ValueError:
+            pass
+    mismatch = v_rid is not None and v_rid != effective_rid
+
     if context.output_json:
         flag_list = [name for bit, name in _ACCOUNT_FLAGS.items() if f["account_flags"] & bit]
-        print(json.dumps({
+        out: dict = {
             "rid": effective_rid,
             "sid": sid,
             "username": v["username"],
@@ -258,8 +268,21 @@ def account(
             "last_failed_logon": _ft_iso(f["last_failed_logon"]),
             "logon_count": f["logon_count"],
             "failed_count": f["failed_count"],
-        }, indent=2))
+        }
+        if mismatch:
+            out["mismatch_warning"] = (
+                f"F blob RID ({effective_rid}) does not match V blob RID ({v_rid}) — "
+                "these blobs belong to different accounts"
+            )
+        print(json.dumps(out, indent=2))
         return
+
+    if mismatch:
+        console.print(
+            f"[bold yellow]WARNING:[/bold yellow] F blob RID ({effective_rid}) does not match "
+            f"V blob RID ({v_rid}) — these blobs belong to different accounts. "
+            f"Results below combine mismatched data."
+        )
 
     id_table = Table(title="Identity", box=box.ROUNDED, header_style="bold")
     id_table.add_column("RID", justify="right")
