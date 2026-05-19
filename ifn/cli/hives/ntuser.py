@@ -19,6 +19,7 @@ _RECENT_DOCS_HEADERS = ["MRU #", "Type", "Name"]
 _AUTORUN_HEADERS = ["Source", "Name", "Command"]
 _TYPED_URLS_HEADERS = ["Key", "URL"]
 _ENV_HEADERS = ["Variable", "Value"]
+_APPCOMPAT_HEADERS = ["Source", "Application path", "Details"]
 
 
 def _open_hive(path: Path) -> Registry.Registry:
@@ -60,6 +61,42 @@ def _decode_recent_name(data: bytes) -> str:
     return data[:32].hex(" ").upper()
 
 
+_BEEF0004 = 0xBEEF0004
+# Unicode long-name offset within the BEEF0004 extension block, keyed by version
+_BEEF_UNICODE_OFFSET: dict[int, int] = {3: 0x12, 7: 0x22, 8: 0x1E, 9: 0x30}
+
+
+def _extract_unicode_name(data: bytes, short_name_end: int) -> str:
+    """Return the Unicode long filename from the BEEF0004 extension block, or ''."""
+    pos = short_name_end + 1
+    if pos % 2:
+        pos += 1
+    if pos + 8 > len(data):
+        return ""
+    ext_size = struct.unpack_from("<H", data, pos)[0]
+    if ext_size < 8 or pos + ext_size > len(data):
+        return ""
+    version = struct.unpack_from("<H", data, pos + 2)[0]
+    sig = struct.unpack_from("<I", data, pos + 4)[0]
+    if sig != _BEEF0004:
+        return ""
+    uni_off = _BEEF_UNICODE_OFFSET.get(version, 0)
+    if not uni_off:
+        return ""
+    name_start = pos + uni_off
+    if name_start + 2 > len(data):
+        return ""
+    # Walk forward in 2-byte steps until aligned null terminator
+    i = name_start
+    while i + 1 < len(data) and not (data[i] == 0 and data[i + 1] == 0):
+        i += 2
+    raw = data[name_start:i]
+    try:
+        return raw.decode("utf-16-le", errors="replace") if raw else ""
+    except Exception:
+        return ""
+
+
 def _decode_shellitem(data: bytes) -> str:
     if len(data) < 3:
         return data.hex(" ").upper()
@@ -70,11 +107,13 @@ def _decode_shellitem(data: bytes) -> str:
         if item_type == 0x2F:
             return chr(data[3]) + ":\\"
         if item_type in (0x31, 0x32, 0xB1):
-            end = data.find(b"\x00", 6)
-            if end > 6:
-                name = data[6:end].decode("ascii", errors="replace")
-                if all(0x20 <= ord(c) < 0x7F for c in name):
-                    return name
+            # Short name (8.3 ASCII) starts at offset 0x0E
+            end = data.find(b"\x00", 0x0E)
+            if end > 0x0E:
+                short = data[0x0E:end].decode("ascii", errors="replace")
+                if all(0x20 <= ord(c) < 0x7F for c in short):
+                    long_name = _extract_unicode_name(data, end)
+                    return long_name if long_name else short
         if item_type == 0x74:
             end = data.find(b"\x00", 5)
             if end > 5:
@@ -210,11 +249,30 @@ def activity(
         for val in sorted(url_key.values(), key=lambda v: v.name()):
             typed_urls.append((val.name(), str(val.value())))
 
+    # --- AppCompatFlags ---
+    appcompat_rows: list[tuple[str, str, str]] = []
+    store_key = _try_open(
+        reg,
+        "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags"
+        "\\Compatibility Assistant\\Store",
+    )
+    if store_key:
+        for val in store_key.values():
+            appcompat_rows.append(("Store", val.name(), ""))
+    layers_key = _try_open(
+        reg,
+        "Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers",
+    )
+    if layers_key:
+        for val in layers_key.values():
+            appcompat_rows.append(("Layers", val.name(), str(val.value())))
+
     if context.output_json:
         print(json.dumps({
             "recent_docs": [{"mru": m, "type": t, "name": n} for m, t, n in recent_docs],
             "autorun": [{"source": s, "name": n, "command": c} for s, n, c in autorun_rows],
             "typed_urls": [{"key": k, "url": u} for k, u in typed_urls],
+            "appcompat": [{"source": s, "path": p, "details": d} for s, p, d in appcompat_rows],
         }, indent=2))
         return
 
@@ -254,10 +312,23 @@ def activity(
     else:
         console.print("[dim]TypedURLs key not found.[/dim]")
 
+    console.rule("[bold]Application Compatibility (AppCompatFlags)[/bold]")
+    if appcompat_rows:
+        ac_table = Table(box=box.SIMPLE, header_style="bold")
+        ac_table.add_column("Source", style="dim", no_wrap=True)
+        ac_table.add_column("Application path")
+        ac_table.add_column("Details")
+        for source, path, details in appcompat_rows:
+            ac_table.add_row(source, path, details)
+        console.print(ac_table)
+    else:
+        console.print("[dim]AppCompatFlags key not found.[/dim]")
+
     if csv_out is not None:
         _write_csv(_csv_path(csv_out, "recent_docs"), _RECENT_DOCS_HEADERS, [list(r) for r in recent_docs], console)
         _write_csv(_csv_path(csv_out, "autorun"), _AUTORUN_HEADERS, [list(r) for r in autorun_rows], console)
         _write_csv(_csv_path(csv_out, "typed_urls"), _TYPED_URLS_HEADERS, [list(r) for r in typed_urls], console)
+        _write_csv(_csv_path(csv_out, "appcompat"), _APPCOMPAT_HEADERS, [list(r) for r in appcompat_rows], console)
 
 
 @app.command()
