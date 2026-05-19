@@ -11,7 +11,7 @@ from rich import box
 from Registry import Registry
 
 from ifn import context
-from ifn.parsers.sam import parse_v_blob, parse_f_blob, fmt_flags, extract_user_sid
+from ifn.parsers.sam import parse_v_blob, parse_f_blob, fmt_flags, extract_sid_from_v_blob
 
 app = typer.Typer(help="SAM hive analysis")
 
@@ -108,7 +108,7 @@ def users(
 
     domain_sid: str | None = None
     for rid, v_data, _ in entries:
-        sid = extract_user_sid(v_data, rid)
+        sid = extract_sid_from_v_blob(v_data)
         if sid:
             domain_sid = sid.rsplit("-", 1)[0]
             break
@@ -118,7 +118,7 @@ def users(
         for rid, v_data, f_data in entries:
             v = parse_v_blob(v_data)
             f = parse_f_blob(f_data)
-            sid = extract_user_sid(v_data, rid) or (f"{domain_sid}-{rid}" if domain_sid else f"S-1-5-21-???-{rid}")
+            sid = extract_sid_from_v_blob(v_data) or (f"{domain_sid}-{rid}" if domain_sid else f"S-1-5-21-???-{rid}")
             result.append({
                 "rid": rid,
                 "sid": sid,
@@ -158,7 +158,7 @@ def users(
     for rid, v_data, f_data in entries:
         v = parse_v_blob(v_data)
         f = parse_f_blob(f_data)
-        sid = extract_user_sid(v_data, rid) or (f"{domain_sid}-{rid}" if domain_sid else f"S-1-5-21-???-{rid}")
+        sid = extract_sid_from_v_blob(v_data) or (f"{domain_sid}-{rid}" if domain_sid else f"S-1-5-21-???-{rid}")
         flags_str = f"0x{f['account_flags']:04X}  {fmt_flags(f['account_flags'])}"
         username = v["username"] or f"RID {rid}"
         last_pw = _fmt_ts(f["last_pw_change"], pw_must_change=f["pw_must_change"])

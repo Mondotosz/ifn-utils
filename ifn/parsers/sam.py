@@ -46,12 +46,30 @@ def _read_field(data: bytes, index: int) -> tuple[int, int, bytes]:
     return rel_off, length, content
 
 
+# SID layout: 01 05 00 00 00 00 00 05 | 15 00 00 00 | X(4) | Y(4) | Z(4) | RID(4)
+#              rev=1, 5 sub-auths, NT Authority  sub-auth[0]=21  domain sub-auths   user RID
+_SID_MARKER = b"\x01\x05\x00\x00\x00\x00\x00\x05\x15\x00\x00\x00"
+
+
+def extract_sid_from_v_blob(v_data: bytes) -> str | None:
+    """Extract the domain user SID directly from the V blob (no RID required).
+
+    Searches for the S-1-5-21 marker in the embedded security descriptor.
+    Returns 'S-1-5-21-X-Y-Z-RID' or None if not found.
+    """
+    pos = v_data.find(_SID_MARKER)
+    if pos < 0 or pos + 28 > len(v_data):
+        return None
+    x   = struct.unpack_from("<I", v_data, pos + 12)[0]
+    y   = struct.unpack_from("<I", v_data, pos + 16)[0]
+    z   = struct.unpack_from("<I", v_data, pos + 20)[0]
+    rid = struct.unpack_from("<I", v_data, pos + 24)[0]
+    return f"S-1-5-21-{x}-{y}-{z}-{rid}"
+
+
 def extract_user_sid(v_data: bytes, rid: int) -> str | None:
     """Scan V blob for the embedded user SID (S-1-5-21-X-Y-Z-RID) and return it as a string."""
     rid_bytes = struct.pack("<I", rid)
-    # SID layout: 01 05 00 00 00 00 00 05 | 15 00 00 00 | X(4) | Y(4) | Z(4) | RID(4)
-    #              8-byte header            sub-auth[0]=21        domain             user
-    # RID is at offset 24 from the SID start, so SID start = match_pos - 24
     pos = v_data.find(rid_bytes)
     while pos >= 24:
         sid_start = pos - 24
