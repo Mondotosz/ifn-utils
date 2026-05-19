@@ -576,6 +576,22 @@ def record(
             )
             raise typer.Exit(1)
 
+        if attr.non_resident and raw_vol is not None:
+            # Verify the raw_vol file looks like an actual volume (has a valid VBR)
+            # before attempting cluster reads; $MFT dumps lack a VBR at offset 0.
+            try:
+                _vol_geometry(raw_vol)
+            except (ValueError, OSError):
+                console.print(
+                    f"[red]Cannot extract non-resident $DATA: "
+                    f"'{raw_vol.name}' does not appear to be a raw volume image.[/red]\n"
+                    f"[dim]The $DATA attribute stores its content in clusters on disk "
+                    f"(LCN {attr.runs[0].lcn if attr.runs else '?'}, "
+                    f"{attr.real_size:,} bytes across {len(attr.runs)} run(s)).\n"
+                    f"Provide the full raw NTFS volume instead of the $MFT file to follow data runs.[/dim]"
+                )
+                raise typer.Exit(1)
+
         console.print(f"[dim]Extracting {stream_label} → {extract}…[/dim]")
         try:
             content = _extract_file_data(raw_vol or file, fixed, attr)
@@ -703,42 +719,46 @@ def scan(
         if not fn_attrs:
             count += 1
             continue
-        for fn_attr in fn_attrs:
-            d = fn_attr.decoded
-            if not d:
-                continue
-            if skip and skipped < skip:
-                skipped += 1
-                break
-            row = [
-                str(rec.record_number or count),
-                d.get("Filename", "?"),
-                d.get("Parent MFT#", "?"),
-                "DIR" if rec.is_directory else "file",
-                d.get("Created", "?"),
-                d.get("Modified", "?"),
-                d.get("Real size", "?"),
-                str(entry_offset),
-                str(entry_offset // _SECTOR),
-            ]
-            if not context.output_json:
-                table.add_row(*row)
-            if csv_out is not None:
-                csv_rows.append(row)
-            if context.output_json:
-                json_rows.append({
-                    "mft_num": row[0],
-                    "filename": row[1],
-                    "parent_mft": row[2],
-                    "type": row[3],
-                    "created": row[4],
-                    "modified": row[5],
-                    "size": row[6],
-                    "offset": entry_offset,
-                    "sector": entry_offset // _SECTOR,
-                })
-            shown += 1
-            break
+        decoded_fns = [a.decoded for a in fn_attrs if a.decoded]
+        if not decoded_fns:
+            count += 1
+            continue
+        if skip and skipped < skip:
+            skipped += 1
+            count += 1
+            continue
+        d = decoded_fns[0]
+        filename_str = " | ".join(
+            fn.get("Filename", "?") for fn in decoded_fns if fn.get("Filename")
+        ) or "?"
+        row = [
+            str(rec.record_number or count),
+            filename_str,
+            d.get("Parent MFT#", "?"),
+            "DIR" if rec.is_directory else "file",
+            d.get("Created", "?"),
+            d.get("Modified", "?"),
+            d.get("Real size", "?"),
+            str(entry_offset),
+            str(entry_offset // _SECTOR),
+        ]
+        if not context.output_json:
+            table.add_row(*row)
+        if csv_out is not None:
+            csv_rows.append(row)
+        if context.output_json:
+            json_rows.append({
+                "mft_num": row[0],
+                "filename": row[1],
+                "parent_mft": row[2],
+                "type": row[3],
+                "created": row[4],
+                "modified": row[5],
+                "size": row[6],
+                "offset": entry_offset,
+                "sector": entry_offset // _SECTOR,
+            })
+        shown += 1
         count += 1
         if limit and shown >= limit:
             break
