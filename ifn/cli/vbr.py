@@ -5,6 +5,8 @@ import tempfile
 from pathlib import Path
 
 import typer
+from rich import box
+from rich.table import Table
 
 from ifn import context
 from ifn.parsers import fat32 as fat32_parser
@@ -262,3 +264,49 @@ def ntfs(
         return
 
     render_hex_table(data, _ntfs_vbr_fields(v, data), title=f"NTFS VBR — {file.name}", console=console)
+
+
+@app.command()
+def compare(
+    primary: Path = typer.Argument(..., help="Primary VBR (512-byte dump)", exists=True),
+    backup:  Path = typer.Argument(..., help="Backup VBR (512-byte dump)",  exists=True),
+) -> None:
+    """Compare a primary NTFS VBR against its backup — highlight any field differences."""
+    console = context.get_console()
+
+    try:
+        vp = ntfs_vbr_parser.parse(primary.read_bytes())
+        vb = ntfs_vbr_parser.parse(backup.read_bytes())
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    pd = _ntfs_vbr_to_dict(vp)
+    bd = _ntfs_vbr_to_dict(vb)
+
+    diffs = [(k, str(pd[k]), str(bd[k])) for k in pd if str(pd[k]) != str(bd[k])]
+
+    if context.output_json:
+        print(json.dumps({
+            "match": len(diffs) == 0,
+            "diffs": [{"field": k, "primary": pv, "backup": bv} for k, pv, bv in diffs],
+        }, indent=2))
+        return
+
+    t = Table(title=f"VBR Comparison — {primary.name} vs {backup.name}",
+              box=box.ROUNDED, header_style="bold")
+    t.add_column("Field")
+    t.add_column("Primary")
+    t.add_column("Backup")
+    for k in pd:
+        pv, bv = str(pd[k]), str(bd[k])
+        if pv != bv:
+            t.add_row(f"[bold red]{k}[/bold red]", f"[red]{pv}[/red]", f"[red]{bv}[/red]")
+        else:
+            t.add_row(f"[dim]{k}[/dim]", f"[dim]{pv}[/dim]", f"[dim]{bv}[/dim]")
+    console.print(t)
+
+    if diffs:
+        console.print(f"[bold red]{len(diffs)} field(s) differ — VBRs DO NOT MATCH[/bold red]")
+    else:
+        console.print("[bold green]VBRs match[/bold green]")

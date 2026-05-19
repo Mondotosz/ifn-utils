@@ -186,12 +186,16 @@ def _decode_standard_info(data: bytes) -> dict:
         "File attrs":   nattr.fmt_file_attrs(file_attrs),
     }
     if len(data) >= 72:
-        owner_id, sec_id, quota, usn = struct.unpack_from("<IIQQ", data, 48)
+        max_versions, version, class_id, owner_id, sec_id = struct.unpack_from("<IIIII", data, 36)
+        quota, usn = struct.unpack_from("<QQ", data, 56)
         out.update({
-            "Owner ID":    str(owner_id),
-            "Security ID": str(sec_id),
-            "Quota used":  f"{quota:,} bytes",
-            "USN":         str(usn),
+            "Max versions": str(max_versions),
+            "Version":      str(version),
+            "Class ID":     str(class_id),
+            "Owner ID":     str(owner_id),
+            "Security ID":  str(sec_id),
+            "Quota used":   f"{quota:,} bytes",
+            "USN":          str(usn),
         })
     return out
 

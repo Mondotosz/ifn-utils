@@ -16,6 +16,7 @@ from rich.table import Table
 from ifn import context
 from ifn.parsers import ntfs_index as nindex
 from ifn.parsers.ntfs_attributes import ATTR_NAMES, fmt_mft_reference
+from ifn.display.hex_table import render_hex_table
 
 
 app = typer.Typer(help="Parse NTFS directory indexes ($I30, INDX buffers)")
@@ -88,17 +89,17 @@ def root(file: Path = typer.Argument(..., exists=True,
         }, indent=2))
         return
 
-    meta = Table(title=f"$INDEX_ROOT — {file.name}", box=box.SIMPLE, header_style="bold")
-    meta.add_column("Field"); meta.add_column("Value")
-    meta.add_row("Indexed attribute",   f"0x{root_obj.attribute_type:02X}  "
-                                         f"{ATTR_NAMES.get(root_obj.attribute_type, '?')}")
-    meta.add_row("Collation rule",      str(root_obj.collation_rule))
-    meta.add_row("Index buffer size",   f"{root_obj.index_buffer_size} B")
-    meta.add_row("Clusters per buffer", str(root_obj.clusters_per_buffer))
-    meta.add_row("Has sub-nodes",       "Yes" if root_obj.header.has_subnodes else "No")
-    meta.add_row("Entries area size",   f"{root_obj.header.entries_size} B")
-    meta.add_row("Allocated size",      f"{root_obj.header.allocated_size} B")
-    console.print(meta)
+    root_fields = [
+        (0x00, 4, "Attr type",          f"0x{root_obj.attribute_type:02X}  {ATTR_NAMES.get(root_obj.attribute_type, '?')}"),
+        (0x04, 4, "Collation rule",     str(root_obj.collation_rule)),
+        (0x08, 4, "Index buffer size",  f"{root_obj.index_buffer_size} B"),
+        (0x0C, 1, "Clusters/buffer",    str(root_obj.clusters_per_buffer)),
+        (0x10, 4, "Entries offset",     str(root_obj.header.entries_offset)),
+        (0x14, 4, "Entries size",       str(root_obj.header.entries_size)),
+        (0x18, 4, "Allocated size",     str(root_obj.header.allocated_size)),
+        (0x1C, 1, "Has sub-nodes",      "Yes" if root_obj.header.has_subnodes else "No"),
+    ]
+    render_hex_table(data[:0x20], root_fields, title=f"$INDEX_ROOT header — {file.name}", console=console)
 
     _render_entries("Entries", root_obj.entries, console)
 
@@ -132,15 +133,18 @@ def indx(
         return
 
     for n, buf in enumerate(buffers):
-        meta = Table(title=f"INDX buffer #{n}  (VCN={buf.vcn})",
-                     box=box.SIMPLE, header_style="bold")
-        meta.add_column("Field"); meta.add_column("Value")
-        meta.add_row("USA offset",        f"0x{buf.usa_offset:04X}")
-        meta.add_row("USA count",         str(buf.usa_count))
-        meta.add_row("LogFile seq",       str(buf.log_seq))
-        meta.add_row("Entries area size", f"{buf.header.entries_size} B")
-        meta.add_row("Allocated size",    f"{buf.header.allocated_size} B")
-        meta.add_row("Has sub-nodes",     "Yes" if buf.header.has_subnodes else "No")
-        console.print(meta)
+        indx_fields = [
+            (0x00, 4, "Signature",      buf.raw[:4].decode("ascii", errors="replace")),
+            (0x04, 2, "USA offset",     f"0x{buf.usa_offset:04X}"),
+            (0x06, 2, "USA count",      str(buf.usa_count)),
+            (0x08, 8, "Log seq #",      str(buf.log_seq)),
+            (0x10, 8, "VCN",            str(buf.vcn)),
+            (0x18, 4, "Entries offset", str(buf.header.entries_offset)),
+            (0x1C, 4, "Entries size",   str(buf.header.entries_size)),
+            (0x20, 4, "Alloc size",     str(buf.header.allocated_size)),
+            (0x24, 1, "Has sub-nodes",  "Yes" if buf.header.has_subnodes else "No"),
+        ]
+        render_hex_table(buf.raw[:0x28], indx_fields,
+                         title=f"INDX buffer #{n}  VCN={buf.vcn} — header", console=console)
 
         _render_entries(f"Entries (buffer #{n})", buf.entries, console)

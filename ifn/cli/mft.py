@@ -198,10 +198,47 @@ def _display_record(data: bytes, title: str, full_dump: bool = False, console=No
             (22, 2, "Flags",             f"0x{rec.flags:04X}  ({rec.flag_names})"),
             (24, 4, "Used size",         f"{rec.used_size} bytes"),
             (28, 4, "Allocated size",    f"{rec.alloc_size} bytes"),
-            (32, 8, "Base record ref",   str(rec.base_record_ref)),
+            (32, 8, "Base record ref",   (f"record={rec.base_record_ref & 0xFFFFFFFFFFFF}"
+                                              f"  seq={(rec.base_record_ref >> 48) & 0xFFFF}"
+                                              if rec.base_record_ref else "0  (this is a base record)")),
             (40, 2, "Next attr ID",      str(rec.next_attr_id)),
             (44, 4, "Record number",     str(rec.record_number)),
         ]
+        # Annotate the actual USA data (check word + per-sector replacements)
+        usa_off = rec.update_seq_offset
+        if usa_off > 0 and usa_off + rec.update_seq_size * 2 <= len(fixed):
+            check = struct.unpack_from("<H", fixed, usa_off)[0]
+            header_fields.append((usa_off, 2, "USA check word", f"0x{check:04X}"))
+            for _i in range(1, rec.update_seq_size):
+                _rep_off = usa_off + _i * 2
+                if _rep_off + 2 <= len(fixed):
+                    _rep = struct.unpack_from("<H", fixed, _rep_off)[0]
+                    header_fields.append((_rep_off, 2, f"USA replacement[{_i}]", f"0x{_rep:04X}"))
+
+        # Annotate attribute headers that fall within the displayed hex range
+        for _attr in rec.attributes:
+            if _attr.attr_type == 0xFFFFFFFF:
+                break
+            _off = _attr.offset
+            if _off >= hex_len:
+                break
+            _lbl = _attr.attr_name
+            if _off + 4  <= hex_len: header_fields.append((_off,    4, f"{_lbl} type",        f"0x{_attr.attr_type:08X}"))
+            if _off + 8  <= hex_len: header_fields.append((_off+4,  4, f"{_lbl} length",      str(_attr.length)))
+            if _off + 9  <= hex_len: header_fields.append((_off+8,  1, f"{_lbl} resident",    "No" if _attr.non_resident else "Yes"))
+            if _off + 16 <= hex_len: header_fields.append((_off+14, 2, f"{_lbl} attr_id",     str(_attr.attr_id)))
+            if not _attr.non_resident:
+                if _off + 22 <= hex_len:
+                    _c_len = struct.unpack_from("<I", fixed, _off + 16)[0]
+                    _c_off = struct.unpack_from("<H", fixed, _off + 20)[0]
+                    header_fields.append((_off+16, 4, f"{_lbl} content_len", str(_c_len)))
+                    header_fields.append((_off+20, 2, f"{_lbl} content_off", f"0x{_c_off:04X}"))
+            else:
+                if _off + 34 <= hex_len:
+                    header_fields.append((_off+16, 8, f"{_lbl} start_vcn",  str(_attr.start_vcn)))
+                    header_fields.append((_off+24, 8, f"{_lbl} last_vcn",   str(_attr.last_vcn)))
+                    header_fields.append((_off+32, 2, f"{_lbl} run_offset", str(_attr.run_offset)))
+
         render_hex_table(fixed[:hex_len], header_fields, title=title, console=console)
 
         attr_table = Table(title="Attributes", box=box.ROUNDED, header_style="bold")
@@ -271,6 +308,21 @@ def _display_record(data: bytes, title: str, full_dump: bool = False, console=No
                                 "sparse" if run.is_sparse else str(run.lcn),
                                 str(run.length))
                 console.print(rrt)
+                continue
+
+            # Resident $DATA: hex + ASCII preview of file content
+            if attr.attr_type == 0x80 and not attr.non_resident and attr.data:
+                _MAX = 256
+                _preview = attr.data[:_MAX]
+                _extra = f", first {_MAX} B shown" if len(attr.data) > _MAX else ""
+                _size_lbl = f" ({len(attr.data)} B{_extra})"
+                _dt = Table(title=label + _size_lbl, box=box.SIMPLE, header_style="bold")
+                _dt.add_column("Hex"); _dt.add_column("ASCII")
+                for _rs in range(0, len(_preview), 16):
+                    _chunk = _preview[_rs: _rs + 16]
+                    _dt.add_row(_chunk.hex(" ").upper(),
+                                "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in _chunk))
+                console.print(_dt)
                 continue
 
             # Generic dict decoders
@@ -471,6 +523,7 @@ def record(
                 "data_size": len(attr.data) if not attr.non_resident else None,
                 "decoded": attr.decoded or {},
             })
+        _bref = rec.base_record_ref
         print(json.dumps({
             "magic": rec.magic.decode(errors="replace"),
             "seq_number": rec.seq_number,
@@ -479,6 +532,9 @@ def record(
             "flag_names": rec.flag_names,
             "is_directory": rec.is_directory,
             "is_in_use": rec.is_in_use,
+            "is_extension_record": rec.is_extension_record,
+            "base_record_number": _bref & 0xFFFFFFFFFFFF,
+            "base_record_seq": (_bref >> 48) & 0xFFFF,
             "record_number": rec.record_number,
             "used_size": rec.used_size,
             "alloc_size": rec.alloc_size,
