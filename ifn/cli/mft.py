@@ -326,7 +326,7 @@ def _print_index_root(label: str, root, console) -> None:
 # Image helpers (E01)
 # ---------------------------------------------------------------------------
 
-def _stream_mft_from_image(image: Path, offset: int) -> Iterator[bytes]:
+def _stream_mft_from_image(image: Path, offset: int) -> Iterator[tuple[int, bytes]]:
     """Stream the raw $MFT bytes from an E01 image using icat, 1 record at a time."""
     proc = subprocess.Popen(
         ["icat", "-o", str(offset), str(image), "0"],
@@ -335,14 +335,16 @@ def _stream_mft_from_image(image: Path, offset: int) -> Iterator[bytes]:
     )
     try:
         buf = bytearray()
+        mft_offset = 0
         while True:
             chunk = proc.stdout.read(64 * 1024)
             if not chunk:
                 break
             buf.extend(chunk)
             while len(buf) >= _RECORD_SIZE:
-                yield bytes(buf[:_RECORD_SIZE])
+                yield mft_offset, bytes(buf[:_RECORD_SIZE])
                 del buf[:_RECORD_SIZE]
+                mft_offset += _RECORD_SIZE
     finally:
         proc.stdout.close()
         proc.wait()
@@ -609,7 +611,7 @@ def scan(
         console.print("[red]Provide a file argument or --image / --offset.[/red]")
         raise typer.Exit(1)
 
-    _CSV_HEADERS = ["MFT#", "Filename", "Parent#", "Type", "Created", "Modified", "Size"]
+    _CSV_HEADERS = ["MFT#", "Filename", "Parent#", "Type", "Created", "Modified", "Size", "Offset", "Sector"]
 
     table = Table(
         title=f"MFT Scan — {source_name}{'  [raw volume]' if raw else ''}",
@@ -618,7 +620,7 @@ def scan(
     )
     for col, kw in zip(
         _CSV_HEADERS,
-        [{"justify": "right"}, {}, {"justify": "right"}, {}, {}, {}, {"justify": "right"}],
+        [{"justify": "right"}, {}, {"justify": "right"}, {}, {}, {}, {"justify": "right"}, {"justify": "right"}, {"justify": "right"}],
     ):
         table.add_column(col, **kw)
 
@@ -628,7 +630,7 @@ def scan(
     csv_rows: list[list[str]] = []
     json_rows: list[dict] = []
 
-    for chunk in source:
+    for entry_offset, chunk in source:
         if len(chunk) < 48 or chunk[:4] != b"FILE":
             count += 1
             continue
@@ -660,6 +662,8 @@ def scan(
                 d.get("Created", "?"),
                 d.get("Modified", "?"),
                 d.get("Real size", "?"),
+                str(entry_offset),
+                str(entry_offset // _SECTOR),
             ]
             if not context.output_json:
                 table.add_row(*row)
@@ -674,6 +678,8 @@ def scan(
                     "created": row[4],
                     "modified": row[5],
                     "size": row[6],
+                    "offset": entry_offset,
+                    "sector": entry_offset // _SECTOR,
                 })
             shown += 1
             break
@@ -701,10 +707,12 @@ def scan(
 # Internal iterators
 # ---------------------------------------------------------------------------
 
-def _iter_file(path: Path, offset_sectors: int = 0, max_sectors: int = 0) -> Iterator[bytes]:
+def _iter_file(path: Path, offset_sectors: int = 0, max_sectors: int = 0) -> Iterator[tuple[int, bytes]]:
+    start_byte = offset_sectors * 512
+    pos = start_byte
     with path.open("rb") as f:
         if offset_sectors:
-            f.seek(offset_sectors * 512)
+            f.seek(start_byte)
         remaining = max_sectors * 512 if max_sectors else None
         while True:
             to_read = _RECORD_SIZE
@@ -717,17 +725,19 @@ def _iter_file(path: Path, offset_sectors: int = 0, max_sectors: int = 0) -> Ite
                 break
             if remaining is not None:
                 remaining -= len(chunk)
-            yield chunk
+            yield pos, chunk
+            pos += len(chunk)
 
 
-def _iter_raw_volume(path: Path, offset_sectors: int = 0, max_sectors: int = 0) -> Iterator[bytes]:
+def _iter_raw_volume(path: Path, offset_sectors: int = 0, max_sectors: int = 0) -> Iterator[tuple[int, bytes]]:
     """Scan a raw volume for FILE records at 512-byte boundaries."""
     CHUNK = 1024 * 1024
     buf = bytearray()
     remaining = max_sectors * 512 if max_sectors else None
+    buf_base = offset_sectors * 512
     with open(path, "rb") as f:
         if offset_sectors:
-            f.seek(offset_sectors * 512)
+            f.seek(buf_base)
         while True:
             to_read = CHUNK
             if remaining is not None:
@@ -743,8 +753,10 @@ def _iter_raw_volume(path: Path, offset_sectors: int = 0, max_sectors: int = 0) 
             i = 0
             while i + _RECORD_SIZE <= len(buf):
                 if buf[i: i + 4] == b"FILE":
-                    yield bytes(buf[i: i + _RECORD_SIZE])
+                    yield buf_base + i, bytes(buf[i: i + _RECORD_SIZE])
                 i += _SECTOR
             keep = _RECORD_SIZE - _SECTOR
             if len(buf) > keep:
-                del buf[: len(buf) - keep]
+                trimmed = len(buf) - keep
+                buf_base += trimmed
+                del buf[:trimmed]
