@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Iterator
 import csv
+import io
 import json
 import subprocess
 import struct
@@ -464,7 +465,8 @@ def record(
     console = context.get_console()
 
     # ── 1. Obtain the raw 1 KB record bytes ────────────────────────────────
-    raw_vol: Path | None = None  # set when source is a raw volume file
+    raw_vol: Path | None = None      # set when source is a raw volume file
+    archive_source: _ArchiveSource | None = None  # set when source is a .7z archive
 
     if image is not None:
         if offset is None:
@@ -480,7 +482,17 @@ def record(
         if not file.exists():
             console.print(f"[red]File not found: {file}[/red]")
             raise typer.Exit(1)
-        if raw:
+        if file.suffix.lower() == ".7z":
+            if entry is None:
+                console.print("[red]--entry is required for 7z archive sources.[/red]")
+                raise typer.Exit(1)
+            archive_source = _ArchiveSource(file)
+            data = archive_source.read_entry(entry, console=console if not context.output_json else None)
+            if data is None:
+                console.print(f"[red]Entry #{entry} is beyond the end of $MFT in {file.name}.[/red]")
+                raise typer.Exit(1)
+            title = f"MFT Entry #{entry} — {file.name}"
+        elif raw:
             if entry is None:
                 console.print("[red]--entry is required with --raw.[/red]")
                 raise typer.Exit(1)
@@ -568,7 +580,42 @@ def record(
                           f"{', '.join(names)}[/red]")
             raise typer.Exit(1)
 
-        if attr.non_resident and raw_vol is None:
+        if archive_source is not None:
+            # ── Archive (7z) extraction path ───────────────────────────────
+            if not attr.non_resident:
+                content = attr.data
+            elif not rec.is_in_use:
+                console.print(
+                    "[red]Cannot extract non-resident $DATA: record is deleted.[/red]\n"
+                    "[dim]The file's clusters were on the volume but are not preserved "
+                    "in the archive.[/dim]"
+                )
+                raise typer.Exit(1)
+            else:
+                if stream is not None:
+                    console.print(
+                        "[red]Alternate data stream extraction is not supported for "
+                        "archive sources.[/red]"
+                    )
+                    raise typer.Exit(1)
+                arc_path = archive_source.resolve_path(entry)
+                if arc_path is None:
+                    console.print(
+                        "[red]Could not reconstruct the file path from the MFT parent chain.[/red]"
+                    )
+                    raise typer.Exit(1)
+                console.print(f"[dim]Extracting '{arc_path}' from archive → {extract}…[/dim]")
+                content = archive_source.extract_file(arc_path)
+                if content is None:
+                    console.print(
+                        f"[red]File not found in archive: {arc_path}[/red]\n"
+                        "[dim]The file may have been excluded when the archive was created.[/dim]"
+                    )
+                    raise typer.Exit(1)
+            extract.write_bytes(content)
+            console.print(f"[green]✓ Extracted {len(content):,} bytes → {extract}[/green]")
+
+        elif attr.non_resident and raw_vol is None:
             console.print(
                 "[red]$DATA is non-resident (file content is stored in clusters on disk).[/red]\n"
                 "[dim]Re-run with --raw <volume.bin> --entry <N> so the tool can follow "
@@ -576,7 +623,7 @@ def record(
             )
             raise typer.Exit(1)
 
-        if attr.non_resident and raw_vol is not None:
+        elif attr.non_resident and raw_vol is not None:
             # Verify the raw_vol file looks like an actual volume (has a valid VBR)
             # before attempting cluster reads; $MFT dumps lack a VBR at offset 0.
             try:
@@ -592,16 +639,15 @@ def record(
                 )
                 raise typer.Exit(1)
 
-        console.print(f"[dim]Extracting {stream_label} → {extract}…[/dim]")
-        try:
-            content = _extract_file_data(raw_vol or file, fixed, attr)
-        except (OSError, RuntimeError) as e:
-            console.print(f"[red]Extraction failed: {e}[/red]")
-            raise typer.Exit(1)
+            console.print(f"[dim]Extracting {stream_label} → {extract}…[/dim]")
+            try:
+                content = _extract_file_data(raw_vol, fixed, attr)
+            except (OSError, RuntimeError) as e:
+                console.print(f"[red]Extraction failed: {e}[/red]")
+                raise typer.Exit(1)
 
-        extract.write_bytes(content)
+            extract.write_bytes(content)
 
-        if attr.non_resident:
             a = attr.offset
             run_off_rel = struct.unpack_from("<H", fixed, a + 0x20)[0]
             run_data = fixed[a + run_off_rel: a + attr.length]
@@ -627,7 +673,18 @@ def record(
             except Exception:
                 pass
 
-        console.print(f"[green]✓ Extracted {len(content):,} bytes → {extract}[/green]")
+            console.print(f"[green]✓ Extracted {len(content):,} bytes → {extract}[/green]")
+
+        else:
+            # Resident, no archive — extract directly
+            console.print(f"[dim]Extracting {stream_label} → {extract}…[/dim]")
+            try:
+                content = _extract_file_data(file, fixed, attr)
+            except (OSError, RuntimeError) as e:
+                console.print(f"[red]Extraction failed: {e}[/red]")
+                raise typer.Exit(1)
+            extract.write_bytes(content)
+            console.print(f"[green]✓ Extracted {len(content):,} bytes → {extract}[/green]")
 
 
 # ---------------------------------------------------------------------------
@@ -669,16 +726,21 @@ def scan(
         if not file.exists():
             console.print(f"[red]File not found: {file}[/red]")
             raise typer.Exit(1)
-        if raw:
+        if file.suffix.lower() == ".7z":
+            _arc = _ArchiveSource(file)
+            source = _arc.iter_mft(console=console if not context.output_json else None)
+            source_name = file.name
+        elif raw:
             if not context.output_json:
                 console.print(f"[dim]Raw volume scan of {file.name} "
                               "(FILE records at 512-byte boundaries)…[/dim]")
             source = _iter_raw_volume(file, offset_sectors=offset or 0, max_sectors=sectors)
+            source_name = file.name
         else:
             if not context.output_json:
                 console.print(f"[dim]Scanning $MFT dump: {file.name}[/dim]")
             source = _iter_file(file, offset_sectors=offset or 0, max_sectors=sectors)
-        source_name = file.name
+            source_name = file.name
     else:
         console.print("[red]Provide a file argument or --image / --offset.[/red]")
         raise typer.Exit(1)
@@ -836,3 +898,141 @@ def _iter_raw_volume(path: Path, offset_sectors: int = 0, max_sectors: int = 0) 
                 trimmed = len(buf) - keep
                 buf_base += trimmed
                 del buf[:trimmed]
+
+
+# ---------------------------------------------------------------------------
+# 7z archive source
+# ---------------------------------------------------------------------------
+
+class _MemWriterFactory:
+    """py7zr WriterFactory implementation that writes extracted files to BytesIO buffers."""
+
+    def __init__(self) -> None:
+        self.buffers: dict[str, io.BytesIO] = {}
+
+    def create(self, filename: str) -> io.BytesIO:
+        buf = io.BytesIO()
+        self.buffers[filename] = buf
+        return buf
+
+    def get(self, filename: str) -> bytes:
+        buf = self.buffers.get(filename)
+        if buf is None:
+            return b""
+        buf.seek(0)
+        return buf.read()
+
+
+# Make it a proper py7zr WriterFactory subclass at import time so we don't
+# import py7zr at module level (keeping the dependency optional).
+def _make_writer_factory_class():
+    try:
+        from py7zr.py7zr import WriterFactory as _WF
+        class _RealMemWriterFactory(_MemWriterFactory, _WF):  # type: ignore[misc]
+            pass
+        return _RealMemWriterFactory
+    except ImportError:
+        return _MemWriterFactory
+
+_MemWriterFactoryCls = _make_writer_factory_class()
+
+
+class _ArchiveSource:
+    """Lazy-loading 7z archive that caches the $MFT bytes in memory.
+
+    All MFT scanning and single-entry reads use the in-memory copy.
+    Per-file extraction opens a fresh SevenZipFile to avoid state issues.
+    """
+
+    _MFT_NAME = "$MFT"
+    # MFT entry numbers that are reserved / root — stop walking parents here
+    _ROOT_ENTRIES = frozenset({0, 1, 2, 3, 4, 5})
+    # $FILE_NAME namespaces we prefer for path reconstruction (avoid 8.3 names)
+    _LONG_NAME_NS = {"POSIX", "Win32", "Win32&DOS"}
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._mft: bytes | None = None
+
+    # ------------------------------------------------------------------
+    # MFT access
+    # ------------------------------------------------------------------
+
+    def _load_mft(self, console=None) -> bytes:
+        if self._mft is None:
+            import py7zr
+            if console is not None:
+                console.print(f"[dim]Decompressing $MFT from {self.path.name}…[/dim]")
+            factory = _MemWriterFactoryCls()
+            with py7zr.SevenZipFile(self.path, "r") as z:
+                z.extract(targets=[self._MFT_NAME], factory=factory)
+            self._mft = factory.get(self._MFT_NAME)
+            if not self._mft:
+                raise RuntimeError(f"$MFT not found in {self.path.name}")
+        return self._mft
+
+    def iter_mft(self, console=None) -> Iterator[tuple[int, bytes]]:
+        data = self._load_mft(console)
+        pos = 0
+        while pos + _RECORD_SIZE <= len(data):
+            yield pos, data[pos: pos + _RECORD_SIZE]
+            pos += _RECORD_SIZE
+
+    def read_entry(self, entry_num: int, console=None) -> bytes | None:
+        data = self._load_mft(console)
+        offset = entry_num * _RECORD_SIZE
+        if offset + _RECORD_SIZE > len(data):
+            return None
+        return data[offset: offset + _RECORD_SIZE]
+
+    # ------------------------------------------------------------------
+    # Path reconstruction
+    # ------------------------------------------------------------------
+
+    def resolve_path(self, entry_num: int) -> str | None:
+        """Walk the MFT parent chain to reconstruct the archive path for entry_num.
+
+        Returns a forward-slash path like 'Users/Alice/file.txt', or None if the
+        chain cannot be resolved.
+        """
+        parts: list[str] = []
+        seen: set[int] = set()
+        current = entry_num
+        while current not in self._ROOT_ENTRIES and current not in seen:
+            seen.add(current)
+            raw = self.read_entry(current)
+            if raw is None:
+                return None
+            fixed = _apply_usa_fixup(raw)
+            rec = mft_parser.parse(fixed)
+            fn_attrs = [a for a in rec.attributes if a.attr_type == 0x30]
+            decoded_fns = [a.decoded for a in fn_attrs if a.decoded]
+            if not decoded_fns:
+                return None
+            # Prefer long (Win32/POSIX) name to avoid 8.3 aliases in path
+            best = next(
+                (d for d in decoded_fns if d.get("Namespace") in self._LONG_NAME_NS),
+                decoded_fns[0],
+            )
+            name = best.get("Filename", "")
+            if not name:
+                return None
+            parts.append(name)
+            try:
+                current = int(best.get("Parent MFT#", "5"))
+            except ValueError:
+                break
+        return "/".join(reversed(parts))
+
+    # ------------------------------------------------------------------
+    # File extraction
+    # ------------------------------------------------------------------
+
+    def extract_file(self, archive_path: str) -> bytes | None:
+        """Extract a single file from the archive into memory. Returns None if not found."""
+        import py7zr
+        factory = _MemWriterFactoryCls()
+        with py7zr.SevenZipFile(self.path, "r") as z:
+            z.extract(targets=[archive_path], factory=factory)
+        data = factory.get(archive_path)
+        return data if data else None

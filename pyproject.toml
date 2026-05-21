@@ -5,7 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+  "libewf-python>=20240506",
   "lnkparse3>=1.6.0",
+  "py7zr>=1.1.0",
   "python-registry>=1.3.1",
   "rich>=15.0.0",
   "typer>=0.25.1",
