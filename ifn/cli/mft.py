@@ -1,7 +1,10 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Iterator
+from dataclasses import dataclass
 import csv
+import gzip
+import hashlib
 import io
 import json
 import subprocess
@@ -9,6 +12,7 @@ import struct
 
 import typer
 from rich.table import Table
+from rich.tree import Tree as RichTree
 from rich import box
 
 from ifn import context
@@ -1036,3 +1040,505 @@ class _ArchiveSource:
             z.extract(targets=[archive_path], factory=factory)
         data = factory.get(archive_path)
         return data if data else None
+
+
+# ---------------------------------------------------------------------------
+# Shared directory-index helpers (used by ls + tree)
+# ---------------------------------------------------------------------------
+
+_LONG_NS = {"POSIX", "Win32", "Win32&DOS"}
+
+
+@dataclass
+class _MFTEntry:
+    mft_num: int
+    names: list[str]        # long name first; multiple names joined with " | " for display
+    parent: int
+    is_dir: bool
+    is_in_use: bool
+    size: str               # e.g. "1,234 bytes"
+    created: str
+    modified: str
+
+    @property
+    def label(self) -> str:
+        return " | ".join(self.names) or "?"
+
+
+def _build_dir_index(
+    source: Iterator[tuple[int, bytes]],
+    include_deleted: bool = False,
+) -> tuple[dict[int, list[_MFTEntry]], dict[int, _MFTEntry]]:
+    """Scan the MFT and return ({parent_mft: [children]}, {mft_num: entry})."""
+    by_num: dict[int, _MFTEntry] = {}
+
+    for offset, chunk in source:
+        if len(chunk) < 48 or chunk[:4] != b"FILE":
+            continue
+        fixed = _apply_usa_fixup(chunk)
+        try:
+            rec = mft_parser.parse(fixed)
+        except Exception:
+            continue
+        if not rec.is_valid:
+            continue
+        if not include_deleted and not rec.is_in_use:
+            continue
+
+        fn_attrs = [a for a in rec.attributes if a.attr_type == 0x30]
+        decoded_fns = [a.decoded for a in fn_attrs if a.decoded]
+        if not decoded_fns:
+            continue
+
+        entry_num = rec.record_number or (offset // _RECORD_SIZE)
+        if entry_num in by_num:
+            continue  # first-seen wins (MFT entries are contiguous in dumps)
+
+        best = next(
+            (d for d in decoded_fns if d.get("Namespace") in _LONG_NS),
+            decoded_fns[0],
+        )
+        parent = int(best.get("Parent MFT#", "0") or "0")
+
+        # Collect names: long-name variants first, then remaining (e.g. 8.3)
+        seen_n: set[str] = set()
+        names: list[str] = []
+        for d in sorted(decoded_fns, key=lambda x: 0 if x.get("Namespace") in _LONG_NS else 1):
+            n = d.get("Filename", "")
+            if n and n not in seen_n:
+                seen_n.add(n)
+                names.append(n)
+
+        by_num[entry_num] = _MFTEntry(
+            mft_num=entry_num,
+            names=names,
+            parent=parent,
+            is_dir=rec.is_directory,
+            is_in_use=rec.is_in_use,
+            size=best.get("Real size", "0 bytes"),
+            created=best.get("Created", ""),
+            modified=best.get("Modified", ""),
+        )
+
+    by_parent: dict[int, list[_MFTEntry]] = {}
+    for e in by_num.values():
+        by_parent.setdefault(e.parent, []).append(e)
+
+    return by_parent, by_num
+
+
+def _open_mft_source(
+    file: Optional[Path],
+    image: Optional[Path],
+    offset: Optional[int],
+    raw: bool,
+    sectors: int,
+    console,
+) -> tuple[Iterator[tuple[int, bytes]], str]:
+    """Resolve source options to (record_iterator, display_name).
+
+    Raises typer.Exit(1) on bad arguments (prints error first).
+    """
+    if image is not None:
+        if offset is None:
+            console.print("[red]--offset is required with --image.[/red]")
+            raise typer.Exit(1)
+        if not context.output_json:
+            console.print(f"[dim]Streaming $MFT from {image.name} at offset {offset}…[/dim]")
+        return _stream_mft_from_image(image, offset), f"{image.name} (offset {offset})"
+
+    if file is None:
+        console.print("[red]Provide a file argument or --image.[/red]")
+        raise typer.Exit(1)
+    if not file.exists():
+        console.print(f"[red]File not found: {file}[/red]")
+        raise typer.Exit(1)
+
+    if file.suffix.lower() == ".7z":
+        arc = _ArchiveSource(file)
+        return arc.iter_mft(console=console if not context.output_json else None), file.name
+    elif raw:
+        if not context.output_json:
+            console.print(f"[dim]Raw volume scan of {file.name} (FILE records at 512-byte boundaries)…[/dim]")
+        return _iter_raw_volume(file, offset_sectors=offset or 0, max_sectors=sectors), file.name
+    else:
+        if not context.output_json:
+            console.print(f"[dim]Scanning $MFT dump: {file.name}[/dim]")
+        return _iter_file(file, offset_sectors=offset or 0, max_sectors=sectors), file.name
+
+
+# ---------------------------------------------------------------------------
+# Directory index cache (7z archives only)
+# ---------------------------------------------------------------------------
+
+_CACHE_VERSION = 1
+
+
+def _archive_hash(path: Path) -> str:
+    """Return the SHA-256 hex digest of the entire file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(8 * 1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _cache_path(archive: Path) -> Path:
+    return archive.parent / (archive.name + ".mftidx")
+
+
+def _save_index_cache(path: Path, archive_hash: str, by_num: dict[int, _MFTEntry]) -> None:
+    payload = {
+        "v": _CACHE_VERSION,
+        "hash": archive_hash,
+        # Compact array-of-arrays: [mft_num, names, parent, is_dir, is_in_use, size, created, modified]
+        "e": [
+            [e.mft_num, e.names, e.parent, e.is_dir, e.is_in_use, e.size, e.created, e.modified]
+            for e in by_num.values()
+        ],
+    }
+    with gzip.open(path, "wt", encoding="utf-8", compresslevel=6) as f:
+        json.dump(payload, f, separators=(",", ":"))
+
+
+def _load_index_cache(
+    path: Path,
+    archive_hash: str | None,
+) -> tuple[dict[int, list[_MFTEntry]], dict[int, _MFTEntry]] | None:
+    """Load the cached index.
+
+    If archive_hash is None the hash stored in the cache is not verified —
+    the caller is responsible for warning the user.  Returns None on any
+    version mismatch, corruption, or hash mismatch (when hash is provided).
+    """
+    if not path.exists():
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+    if payload.get("v") != _CACHE_VERSION:
+        return None
+    if archive_hash is not None and payload.get("hash") != archive_hash:
+        return None
+
+    by_num: dict[int, _MFTEntry] = {}
+    for row in payload["e"]:
+        n, names, p, d, u, s, c, m = row
+        by_num[n] = _MFTEntry(mft_num=n, names=names, parent=p,
+                               is_dir=d, is_in_use=u, size=s, created=c, modified=m)
+
+    by_parent: dict[int, list[_MFTEntry]] = {}
+    for e in by_num.values():
+        by_parent.setdefault(e.parent, []).append(e)
+
+    return by_parent, by_num
+
+
+_UNVERIFIED_HINT = (
+    "Cache loaded without hash verification — use --check-hash to confirm "
+    "the index matches the current archive."
+)
+
+
+def _get_dir_index(
+    file: Optional[Path],
+    image: Optional[Path],
+    offset: Optional[int],
+    raw: bool,
+    sectors: int,
+    console,
+    check_hash: bool = False,
+) -> tuple[dict[int, list[_MFTEntry]], dict[int, _MFTEntry], str, str | None]:
+    """Return (by_parent, by_num, source_name, hint).
+
+    *hint* is a non-None string when the cache was loaded without hash
+    verification; commands should print it as a dim notice at the end.
+
+    For .7z archives the index (always built with deleted entries) is cached
+    to <archive>.mftidx.  By default the cache is loaded as-is; pass
+    check_hash=True to compute SHA-256 and reject a stale cache.
+    """
+    if file is not None and file.suffix.lower() == ".7z":
+        cache_file = _cache_path(file)
+
+        if check_hash:
+            if not context.output_json:
+                console.print(f"[dim]Hashing {file.name}…[/dim]")
+            ahash: str | None = _archive_hash(file)
+        else:
+            ahash = None  # skip verification when loading
+
+        cached = _load_index_cache(cache_file, ahash)
+        if cached is not None:
+            by_parent, by_num = cached
+            hint = None if check_hash else _UNVERIFIED_HINT
+            if not context.output_json:
+                console.print(
+                    f"[dim]Loaded index from {cache_file.name}  "
+                    f"({len(by_num):,} entries)[/dim]"
+                )
+            return by_parent, by_num, file.name, hint
+
+        # Cache miss — always compute hash so we can store it
+        if ahash is None:
+            if not context.output_json:
+                console.print(f"[dim]Hashing {file.name} (first run — building cache)…[/dim]")
+            ahash = _archive_hash(file)
+
+        source, source_name = _open_mft_source(file, None, None, False, 0, console)
+        if not context.output_json:
+            console.print(f"[dim]Building directory index from {source_name}…[/dim]")
+        by_parent, by_num = _build_dir_index(source, include_deleted=True)
+
+        try:
+            _save_index_cache(cache_file, ahash, by_num)
+            if not context.output_json:
+                console.print(
+                    f"[dim]Index saved to {cache_file.name}  "
+                    f"({len(by_num):,} entries)[/dim]"
+                )
+        except OSError as exc:
+            if not context.output_json:
+                console.print(f"[yellow]Warning: could not write cache: {exc}[/yellow]")
+
+        return by_parent, by_num, source_name, None
+
+    # Non-archive: build without caching
+    source, source_name = _open_mft_source(file, image, offset, raw, sectors, console)
+    if not context.output_json:
+        console.print(f"[dim]Building directory index from {source_name}…[/dim]")
+    by_parent, by_num = _build_dir_index(source, include_deleted=True)
+    return by_parent, by_num, source_name, None
+
+
+# ---------------------------------------------------------------------------
+# ls command
+# ---------------------------------------------------------------------------
+
+@app.command(name="ls")
+def ls_cmd(
+    file: Optional[Path] = typer.Argument(None, help="$MFT dump, raw NTFS volume, or .7z archive"),
+    image: Optional[Path] = typer.Option(None, "--image", "-i", help="E01 image — streams $MFT via icat"),
+    offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start in sectors"),
+    raw: bool = typer.Option(False, "--raw", help="Raw volume scan (FILE records at 512-byte boundaries)"),
+    entry: int = typer.Option(5, "--entry", "-e", help="MFT entry number of the directory to list (default: 5 = root)"),
+    show_deleted: bool = typer.Option(False, "--deleted", help="Include deleted entries"),
+    check_hash: bool = typer.Option(False, "--check-hash", help="Verify the .7z cache against the archive SHA-256 before use"),
+    csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export listing to CSV"),
+) -> None:
+    """List the contents of an NTFS directory by MFT entry number.
+
+    Sources (pick one):\\n
+      mft ls mft.bin --entry 5         From a pre-extracted $MFT dump\\n
+      mft ls evidence.7z               From a 7z archive (auto-detected)\\n
+      mft ls --image disk.E01 --offset 128
+    """
+    console = context.get_console()
+    by_parent, by_num, source_name, cache_hint = _get_dir_index(
+        file, image, offset, raw, 0, console, check_hash=check_hash
+    )
+
+    if entry not in by_num and entry not in by_parent:
+        console.print(f"[red]MFT entry #{entry} not found.[/red]")
+        raise typer.Exit(1)
+
+    children = [e for e in by_parent.get(entry, []) if e.mft_num != entry]
+    if not show_deleted:
+        children = [e for e in children if e.is_in_use]
+    children.sort(key=lambda e: (0 if e.is_dir else 1, e.label.lower()))
+
+    _LS_HEADERS = ["MFT#", "Type", "Filename", "Size", "Modified"]
+
+    if context.output_json:
+        print(json.dumps([
+            {
+                "mft_num": e.mft_num,
+                "type": "DIR" if e.is_dir else "file",
+                "filenames": e.names,
+                "size": e.size,
+                "modified": e.modified,
+                "deleted": not e.is_in_use,
+            }
+            for e in children
+        ], indent=2))
+        return
+
+    dir_entry = by_num.get(entry)
+    dir_label = dir_entry.label if dir_entry else f"#{entry}"
+    table = Table(
+        title=f"Directory listing — [{entry}] {dir_label}  ({source_name})",
+        box=box.ROUNDED,
+        header_style="bold",
+    )
+    table.add_column("MFT#", justify="right")
+    table.add_column("Type")
+    table.add_column("Filename")
+    table.add_column("Size", justify="right")
+    table.add_column("Modified")
+
+    csv_rows: list[list[str]] = []
+    for e in children:
+        mft_cell = f"[{e.mft_num}]"
+        type_cell = "DIR" if e.is_dir else "file"
+        name_cell = e.label
+        size_cell = "—" if e.is_dir else e.size
+        mod_cell = e.modified
+        style = "dim" if not e.is_in_use else ""
+        table.add_row(mft_cell, type_cell, name_cell, size_cell, mod_cell, style=style)
+        csv_rows.append([mft_cell, type_cell, name_cell, size_cell, mod_cell])
+
+    console.print(table)
+    console.print(f"[dim]{len(children)} item(s)[/dim]")
+
+    if csv_out is not None:
+        with csv_out.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(_LS_HEADERS)
+            writer.writerows(csv_rows)
+        console.print(f"[green]✓ Exported {len(csv_rows)} row(s) → {csv_out}[/green]")
+
+    if cache_hint:
+        console.print(f"[dim]{cache_hint}[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# tree command
+# ---------------------------------------------------------------------------
+
+def _build_rich_tree(
+    node: RichTree,
+    entry_num: int,
+    by_parent: dict[int, list[_MFTEntry]],
+    current_depth: int,
+    max_depth: int,
+    seen: set[int],
+    show_deleted: bool = False,
+) -> None:
+    if entry_num in seen:
+        return
+    seen.add(entry_num)
+
+    children = [c for c in by_parent.get(entry_num, []) if c.mft_num != entry_num]
+    if not show_deleted:
+        children = [c for c in children if c.is_in_use]
+    children.sort(key=lambda e: (0 if e.is_dir else 1, e.label.lower()))
+
+    if current_depth >= max_depth:
+        if children:
+            node.add(
+                f"[dim]… {len(children)} item{'s' if len(children) != 1 else ''} "
+                f"(increase --depth to expand)[/dim]"
+            )
+        return
+
+    for child in children:
+        n = child.mft_num
+        names = child.names
+        num_part = f"[dim][[/dim]{n}[dim]][/dim]"
+        if len(names) > 1:
+            aliases = " | ".join(names[1:])
+            name_part = (
+                f"[bold]{names[0]}[/bold] [dim]| {aliases}[/dim]"
+                if child.is_dir
+                else f"{names[0]} [dim]| {aliases}[/dim]"
+            )
+        else:
+            name_part = f"[bold]{names[0]}[/bold]" if child.is_dir else (names[0] if names else "?")
+
+        label = (
+            f"[dim]{num_part} {name_part}[/dim]"
+            if not child.is_in_use
+            else f"{num_part} {name_part}"
+        )
+
+        child_node = node.add(label)
+        if child.is_dir:
+            _build_rich_tree(child_node, n, by_parent, current_depth + 1, max_depth, seen, show_deleted)
+
+
+def _build_tree_dict(
+    entry_num: int,
+    by_parent: dict[int, list[_MFTEntry]],
+    by_num: dict[int, _MFTEntry],
+    current_depth: int,
+    max_depth: int,
+    seen: set[int],
+    show_deleted: bool = False,
+) -> dict:
+    e = by_num.get(entry_num)
+    result: dict = {
+        "mft_num": entry_num,
+        "filenames": e.names if e else [],
+        "type": "DIR" if (e and e.is_dir) else "file",
+        "children": [],
+    }
+    if entry_num in seen:
+        return result
+    seen.add(entry_num)
+
+    children = [c for c in by_parent.get(entry_num, []) if c.mft_num != entry_num]
+    if not show_deleted:
+        children = [c for c in children if c.is_in_use]
+    children.sort(key=lambda x: (0 if x.is_dir else 1, x.label.lower()))
+
+    if current_depth < max_depth:
+        for child in children:
+            result["children"].append(
+                _build_tree_dict(child.mft_num, by_parent, by_num,
+                                 current_depth + 1, max_depth, set(seen), show_deleted)
+            )
+    elif children:
+        result["truncated"] = len(children)
+
+    return result
+
+
+@app.command(name="tree")
+def tree_cmd(
+    file: Optional[Path] = typer.Argument(None, help="$MFT dump, raw NTFS volume, or .7z archive"),
+    image: Optional[Path] = typer.Option(None, "--image", "-i", help="E01 image — streams $MFT via icat"),
+    offset: Optional[int] = typer.Option(None, "--offset", "-o", help="Partition start in sectors"),
+    raw: bool = typer.Option(False, "--raw", help="Raw volume scan (FILE records at 512-byte boundaries)"),
+    entry: int = typer.Option(5, "--entry", "-e", help="Root entry number (default: 5 = volume root)"),
+    depth: int = typer.Option(3, "--depth", "-d", help="Maximum recursion depth (default: 3)"),
+    show_deleted: bool = typer.Option(False, "--deleted", help="Include deleted entries"),
+    check_hash: bool = typer.Option(False, "--check-hash", help="Verify the .7z cache against the archive SHA-256 before use"),
+) -> None:
+    """Show a recursive directory tree from any MFT source.
+
+    Sources (pick one):\\n
+      mft tree mft.bin                  From a pre-extracted $MFT dump\\n
+      mft tree evidence.7z              From a 7z archive (auto-detected)\\n
+      mft tree --image disk.E01 --offset 128
+    """
+    console = context.get_console()
+    by_parent, by_num, source_name, cache_hint = _get_dir_index(
+        file, image, offset, raw, 0, console, check_hash=check_hash
+    )
+
+    if entry not in by_num and entry not in by_parent:
+        console.print(f"[red]MFT entry #{entry} not found.[/red]")
+        raise typer.Exit(1)
+
+    root_entry = by_num.get(entry)
+    root_label_name = root_entry.label if root_entry else f"#{entry}"
+
+    if context.output_json:
+        print(json.dumps(
+            _build_tree_dict(entry, by_parent, by_num, 0, depth, set(), show_deleted),
+            indent=2,
+        ))
+        return
+
+    root_label = (
+        f"[dim][[/dim][bold cyan]{entry}[/bold cyan][dim]][/dim]"
+        f" [bold cyan]{root_label_name}[/bold cyan]"
+        f"  [dim]{source_name}[/dim]"
+    )
+    t = RichTree(root_label)
+    _build_rich_tree(t, entry, by_parent, 0, depth, set(), show_deleted)
+    console.print(t)
+    if cache_hint:
+        console.print(f"[dim]{cache_hint}[/dim]")
