@@ -468,6 +468,25 @@ def record(
     """
     console = context.get_console()
 
+    # ── Flag compatibility checks ──────────────────────────────────────────
+    _plain_file = file is not None and file.suffix.lower() not in (".7z",) and image is None and not raw
+    if not context.output_json:
+        if entry is not None and _plain_file:
+            console.print(
+                "[yellow]--entry is ignored for plain 1 KB record dumps — "
+                "use --raw or --image to select an entry from a volume.[/yellow]"
+            )
+        if image is not None and file is not None:
+            console.print("[yellow]--image is set; the positional file argument is ignored.[/yellow]")
+        if image is not None and raw:
+            console.print("[yellow]--raw is ignored when --image is set.[/yellow]")
+        if stream is not None and extract is None:
+            console.print("[yellow]--stream has no effect without --extract.[/yellow]")
+        if offset is not None and _plain_file:
+            console.print("[yellow]--offset is ignored for plain 1 KB record dumps.[/yellow]")
+        if raw and file is not None and file.suffix.lower() == ".7z":
+            console.print("[yellow]--raw is ignored for .7z archive sources.[/yellow]")
+
     # ── 1. Obtain the raw 1 KB record bytes ────────────────────────────────
     raw_vol: Path | None = None      # set when source is a raw volume file
     archive_source: _ArchiveSource | None = None  # set when source is a .7z archive
@@ -717,6 +736,20 @@ def scan(
       mft scan --raw recovered.bin            Raw volume scan (bypass broken MFT index)
     """
     console = context.get_console()
+
+    # ── Flag compatibility checks ──────────────────────────────────────────
+    if not context.output_json:
+        _is_7z = file is not None and file.suffix.lower() == ".7z"
+        if image is not None and file is not None:
+            console.print("[yellow]--image is set; the positional file argument is ignored.[/yellow]")
+        if image is not None and raw:
+            console.print("[yellow]--raw is ignored when --image is set.[/yellow]")
+        if image is not None and sectors:
+            console.print("[yellow]--sectors is ignored when --image is set.[/yellow]")
+        if _is_7z and raw:
+            console.print("[yellow]--raw is ignored for .7z archive sources.[/yellow]")
+        if _is_7z and sectors:
+            console.print("[yellow]--sectors is ignored for .7z archive sources.[/yellow]")
 
     if image is not None:
         if offset is None:
@@ -1336,6 +1369,17 @@ def ls_cmd(
       mft ls --image disk.E01 --offset 128
     """
     console = context.get_console()
+
+    # ── Flag compatibility checks ──────────────────────────────────────────
+    if not context.output_json:
+        _is_7z = file is not None and file.suffix.lower() == ".7z"
+        if image is not None and file is not None:
+            console.print("[yellow]--image is set; the positional file argument is ignored.[/yellow]")
+        if _is_7z and raw:
+            console.print("[yellow]--raw is ignored for .7z archive sources.[/yellow]")
+        if check_hash and not _is_7z:
+            console.print("[yellow]--check-hash only applies to .7z archives; ignored.[/yellow]")
+
     by_parent, by_num, source_name, cache_hint = _get_dir_index(
         file, image, offset, raw, 0, console, check_hash=check_hash
     )
@@ -1514,6 +1558,17 @@ def tree_cmd(
       mft tree --image disk.E01 --offset 128
     """
     console = context.get_console()
+
+    # ── Flag compatibility checks ──────────────────────────────────────────
+    if not context.output_json:
+        _is_7z = file is not None and file.suffix.lower() == ".7z"
+        if image is not None and file is not None:
+            console.print("[yellow]--image is set; the positional file argument is ignored.[/yellow]")
+        if _is_7z and raw:
+            console.print("[yellow]--raw is ignored for .7z archive sources.[/yellow]")
+        if check_hash and not _is_7z:
+            console.print("[yellow]--check-hash only applies to .7z archives; ignored.[/yellow]")
+
     by_parent, by_num, source_name, cache_hint = _get_dir_index(
         file, image, offset, raw, 0, console, check_hash=check_hash
     )
