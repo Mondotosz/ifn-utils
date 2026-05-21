@@ -10,6 +10,7 @@ import json
 import subprocess
 import struct
 
+import re
 import typer
 from rich.table import Table
 from rich.tree import Tree as RichTree
@@ -435,6 +436,63 @@ def _read_mft_entry_from_image(image: Path, offset: int, entry_num: int) -> byte
 
 
 # ---------------------------------------------------------------------------
+# EWF / E01 detection and offset auto-detection
+# ---------------------------------------------------------------------------
+
+_EWF_EXTENSIONS = frozenset({".e01", ".e02", ".e03", ".e04", ".e05", ".ewf", ".ex01"})
+_EWF_MAGIC = b"EVF\x09\x0D\x0A\xFF\x00"
+
+
+def _is_ewf(path: Path) -> bool:
+    """Return True if path is an EWF/E01 image (extension check first, then magic bytes)."""
+    if path.suffix.lower() in _EWF_EXTENSIONS:
+        return True
+    try:
+        with open(path, "rb") as f:
+            return f.read(8) == _EWF_MAGIC
+    except OSError:
+        return False
+
+
+def _detect_ntfs_offset(image: Path, console) -> int:
+    """Run mmls to find the largest NTFS/Basic-data partition offset.
+
+    Exits with a user-facing error if mmls is unavailable or no partition is found.
+    """
+    try:
+        r = subprocess.run(["mmls", str(image)], capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        console.print(
+            "[red]mmls not found — cannot auto-detect partition offset. "
+            "Provide --offset manually or run 'tool deps check'.[/red]"
+        )
+        raise typer.Exit(1)
+    except subprocess.TimeoutExpired:
+        console.print("[red]mmls timed out. Provide --offset manually.[/red]")
+        raise typer.Exit(1)
+
+    best_start: int | None = None
+    best_len = 0
+    for line in r.stdout.splitlines():
+        m = re.match(r"\d{3}:\s+\S+\s+(\d+)\s+\d+\s+(\d+)\s*(.*)", line)
+        if m:
+            start, length, desc = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+            if "basic data" in desc.lower() and length > best_len:
+                best_start, best_len = start, length
+
+    if best_start is None:
+        console.print(
+            "[red]Could not auto-detect NTFS partition offset from mmls output. "
+            "Use --offset to specify it manually.[/red]"
+        )
+        raise typer.Exit(1)
+
+    if not context.output_json:
+        console.print(f"[dim]Auto-detected NTFS partition at sector {best_start}[/dim]")
+    return best_start
+
+
+# ---------------------------------------------------------------------------
 # record command
 # ---------------------------------------------------------------------------
 
@@ -458,9 +516,11 @@ def record(
     """Parse a single MFT record: header, attributes, and decoded fields.
 
     Sources (pick one):\\n
-      mft record entry.bin                             Raw 1 KB dump\\n
-      mft record --image disk.E01 --offset 128 --entry 5   From live E01 image\\n
-      mft record --raw recovered.bin --entry 60        Scan raw volume for entry\\n
+      mft record entry.bin                        Raw 1 KB dump\\n
+      mft record disk.E01 --entry 5               E01 image (auto-detected; offset auto-detected)\\n
+      mft record disk.E01 --entry 5 --offset 128  E01 image with explicit partition offset\\n
+      mft record --image disk.E01 --offset 128 --entry 5  Explicit --image flag (legacy)\\n
+      mft record --raw recovered.bin --entry 60   Scan raw volume for entry\\n
 
     Extra flags (combinable):\\n
       --dump      Show the full 1 KB hex dump instead of just the first sector\\n
@@ -469,13 +529,14 @@ def record(
     console = context.get_console()
 
     # ── Flag compatibility checks ──────────────────────────────────────────
-    _plain_file = file is not None and file.suffix.lower() not in (".7z",) and image is None and not raw
+    _is_ewf_file = file is not None and file.suffix.lower() in _EWF_EXTENSIONS
+    # "plain file" = a 1 KB record dump where --entry and --offset don't apply
+    _plain_file = (
+        file is not None and image is None and not raw and entry is None
+        and file.suffix.lower() not in (".7z",)
+        and not _is_ewf_file
+    )
     if not context.output_json:
-        if entry is not None and _plain_file:
-            console.print(
-                "[yellow]--entry is ignored for plain 1 KB record dumps — "
-                "use --raw or --image to select an entry from a volume.[/yellow]"
-            )
         if image is not None and file is not None:
             console.print("[yellow]--image is set; the positional file argument is ignored.[/yellow]")
         if image is not None and raw:
@@ -486,6 +547,8 @@ def record(
             console.print("[yellow]--offset is ignored for plain 1 KB record dumps.[/yellow]")
         if raw and file is not None and file.suffix.lower() == ".7z":
             console.print("[yellow]--raw is ignored for .7z archive sources.[/yellow]")
+        if raw and _is_ewf_file:
+            console.print("[yellow]--raw is ignored for E01 image sources.[/yellow]")
 
     # ── 1. Obtain the raw 1 KB record bytes ────────────────────────────────
     raw_vol: Path | None = None      # set when source is a raw volume file
@@ -505,7 +568,14 @@ def record(
         if not file.exists():
             console.print(f"[red]File not found: {file}[/red]")
             raise typer.Exit(1)
-        if file.suffix.lower() == ".7z":
+        if _is_ewf(file):
+            if entry is None:
+                console.print("[red]--entry is required for E01 image sources.[/red]")
+                raise typer.Exit(1)
+            _eff_offset = offset if offset is not None else _detect_ntfs_offset(file, console)
+            data = _read_mft_entry_from_image(file, _eff_offset, entry)
+            title = f"MFT Entry #{entry} — {file.name}"
+        elif file.suffix.lower() == ".7z":
             if entry is None:
                 console.print("[red]--entry is required for 7z archive sources.[/red]")
                 raise typer.Exit(1)
@@ -515,7 +585,8 @@ def record(
                 console.print(f"[red]Entry #{entry} is beyond the end of $MFT in {file.name}.[/red]")
                 raise typer.Exit(1)
             title = f"MFT Entry #{entry} — {file.name}"
-        elif raw:
+        elif raw or entry is not None:
+            # --raw was explicit, or --entry implies a raw scan of the file
             if entry is None:
                 console.print("[red]--entry is required with --raw.[/red]")
                 raise typer.Exit(1)
@@ -731,15 +802,17 @@ def scan(
     """Iterate MFT records and print a filename table.
 
     Sources (pick one):\\n
-      mft scan mft.bin                        Pre-extracted $MFT dump\\n
-      mft scan --image disk.E01 --offset 128  Stream $MFT from an E01 image\\n
-      mft scan --raw recovered.bin            Raw volume scan (bypass broken MFT index)
+      mft scan mft.bin              Pre-extracted $MFT dump\\n
+      mft scan disk.E01             E01 image (auto-detected; partition offset auto-detected)\\n
+      mft scan disk.E01 --offset 128  E01 image with explicit partition offset\\n
+      mft scan --raw recovered.bin  Raw volume scan (bypass broken MFT index)
     """
     console = context.get_console()
 
     # ── Flag compatibility checks ──────────────────────────────────────────
     if not context.output_json:
         _is_7z = file is not None and file.suffix.lower() == ".7z"
+        _is_ewf_file = file is not None and file.suffix.lower() in _EWF_EXTENSIONS
         if image is not None and file is not None:
             console.print("[yellow]--image is set; the positional file argument is ignored.[/yellow]")
         if image is not None and raw:
@@ -750,6 +823,10 @@ def scan(
             console.print("[yellow]--raw is ignored for .7z archive sources.[/yellow]")
         if _is_7z and sectors:
             console.print("[yellow]--sectors is ignored for .7z archive sources.[/yellow]")
+        if _is_ewf_file and raw:
+            console.print("[yellow]--raw is ignored for E01 image sources.[/yellow]")
+        if _is_ewf_file and sectors:
+            console.print("[yellow]--sectors is ignored for E01 image sources.[/yellow]")
 
     if image is not None:
         if offset is None:
@@ -763,7 +840,13 @@ def scan(
         if not file.exists():
             console.print(f"[red]File not found: {file}[/red]")
             raise typer.Exit(1)
-        if file.suffix.lower() == ".7z":
+        if _is_ewf(file):
+            _eff_offset = offset if offset is not None else _detect_ntfs_offset(file, console)
+            if not context.output_json:
+                console.print(f"[dim]Streaming $MFT from {file.name} at offset {_eff_offset}…[/dim]")
+            source = _stream_mft_from_image(file, _eff_offset)
+            source_name = f"{file.name} (offset {_eff_offset})"
+        elif file.suffix.lower() == ".7z":
             _arc = _ArchiveSource(file)
             source = _arc.iter_mft(console=console if not context.output_json else None)
             source_name = file.name
@@ -1187,7 +1270,12 @@ def _open_mft_source(
         console.print(f"[red]File not found: {file}[/red]")
         raise typer.Exit(1)
 
-    if file.suffix.lower() == ".7z":
+    if _is_ewf(file):
+        _eff_offset = offset if offset is not None else _detect_ntfs_offset(file, console)
+        if not context.output_json:
+            console.print(f"[dim]Streaming $MFT from {file.name} at offset {_eff_offset}…[/dim]")
+        return _stream_mft_from_image(file, _eff_offset), f"{file.name} (offset {_eff_offset})"
+    elif file.suffix.lower() == ".7z":
         arc = _ArchiveSource(file)
         return arc.iter_mft(console=console if not context.output_json else None), file.name
     elif raw:
@@ -1201,7 +1289,7 @@ def _open_mft_source(
 
 
 # ---------------------------------------------------------------------------
-# Directory index cache (7z archives only)
+# Directory index cache (.7z archives and plain MFT files)
 # ---------------------------------------------------------------------------
 
 _CACHE_VERSION = 1
@@ -1220,16 +1308,29 @@ def _cache_path(archive: Path) -> Path:
     return archive.parent / (archive.name + ".mftidx")
 
 
-def _save_index_cache(path: Path, archive_hash: str, by_num: dict[int, _MFTEntry]) -> None:
-    payload = {
+def _save_index_cache(
+    path: Path,
+    by_num: dict[int, _MFTEntry],
+    *,
+    archive_hash: str | None = None,
+    file_size: int | None = None,
+    file_mtime: float | None = None,
+    raw: bool = False,
+    offset: int = 0,
+) -> None:
+    payload: dict = {
         "v": _CACHE_VERSION,
         "hash": archive_hash,
-        # Compact array-of-arrays: [mft_num, names, parent, is_dir, is_in_use, size, created, modified]
         "e": [
             [e.mft_num, e.names, e.parent, e.is_dir, e.is_in_use, e.size, e.created, e.modified]
             for e in by_num.values()
         ],
     }
+    if file_size is not None:
+        payload["size"]   = file_size
+        payload["mtime"]  = file_mtime
+        payload["raw"]    = raw
+        payload["offset"] = offset
     with gzip.open(path, "wt", encoding="utf-8", compresslevel=6) as f:
         json.dump(payload, f, separators=(",", ":"))
 
@@ -1237,12 +1338,17 @@ def _save_index_cache(path: Path, archive_hash: str, by_num: dict[int, _MFTEntry
 def _load_index_cache(
     path: Path,
     archive_hash: str | None,
+    *,
+    file_size: int | None = None,
+    file_mtime: float | None = None,
+    raw: bool = False,
+    offset: int = 0,
 ) -> tuple[dict[int, list[_MFTEntry]], dict[int, _MFTEntry]] | None:
     """Load the cached index.
 
-    If archive_hash is None the hash stored in the cache is not verified —
-    the caller is responsible for warning the user.  Returns None on any
-    version mismatch, corruption, or hash mismatch (when hash is provided).
+    For .7z: pass archive_hash (or None to skip hash check).
+    For plain files: pass file_size + file_mtime for stat-based validation.
+    Returns None on version mismatch, corruption, or any fingerprint mismatch.
     """
     if not path.exists():
         return None
@@ -1255,6 +1361,11 @@ def _load_index_cache(
         return None
     if archive_hash is not None and payload.get("hash") != archive_hash:
         return None
+    if file_size is not None:
+        if payload.get("size") != file_size or payload.get("mtime") != file_mtime:
+            return None
+        if payload.get("raw", False) != raw or payload.get("offset", 0) != offset:
+            return None
 
     by_num: dict[int, _MFTEntry] = {}
     for row in payload["e"]:
@@ -1287,11 +1398,14 @@ def _get_dir_index(
     """Return (by_parent, by_num, source_name, hint).
 
     *hint* is a non-None string when the cache was loaded without hash
-    verification; commands should print it as a dim notice at the end.
+    verification (.7z only); commands should print it as a dim notice at
+    the end.
 
-    For .7z archives the index (always built with deleted entries) is cached
-    to <archive>.mftidx.  By default the cache is loaded as-is; pass
-    check_hash=True to compute SHA-256 and reject a stale cache.
+    Caching strategy:
+    - .7z archives: cached to <archive>.mftidx; hash-verified only with --check-hash.
+    - Plain files (mft.bin, raw volumes): cached to <file>.mftidx; validated by
+      file size + mtime (fast, no hashing needed).
+    - E01 / --image sources: cached to <image>.mftidx; validated by file size + mtime.
     """
     if file is not None and file.suffix.lower() == ".7z":
         cache_file = _cache_path(file)
@@ -1326,7 +1440,7 @@ def _get_dir_index(
         by_parent, by_num = _build_dir_index(source, include_deleted=True)
 
         try:
-            _save_index_cache(cache_file, ahash, by_num)
+            _save_index_cache(cache_file, by_num, archive_hash=ahash)
             if not context.output_json:
                 console.print(
                     f"[dim]Index saved to {cache_file.name}  "
@@ -1338,10 +1452,112 @@ def _get_dir_index(
 
         return by_parent, by_num, source_name, None
 
-    # Non-archive: build without caching
+    if file is not None and image is None and not _is_ewf(file):
+        # Plain file (mft.bin, raw volume): cache by size + mtime
+        cache_file = _cache_path(file)
+        st = file.stat()
+
+        cached = _load_index_cache(
+            cache_file, None,
+            file_size=st.st_size, file_mtime=st.st_mtime,
+            raw=raw, offset=offset or 0,
+        )
+        if cached is not None:
+            by_parent, by_num = cached
+            if not context.output_json:
+                console.print(
+                    f"[dim]Loaded index from {cache_file.name}  "
+                    f"({len(by_num):,} entries)[/dim]"
+                )
+            return by_parent, by_num, file.name, None
+
+        # Cache miss — scan the source
+        source, source_name = _open_mft_source(file, None, offset, raw, sectors, console)
+        if not context.output_json:
+            console.print(f"[dim]Building directory index from {source_name}…[/dim]")
+        by_parent, by_num = _build_dir_index(source, include_deleted=True)
+
+        try:
+            _save_index_cache(
+                cache_file, by_num,
+                file_size=st.st_size, file_mtime=st.st_mtime,
+                raw=raw, offset=offset or 0,
+            )
+            if not context.output_json:
+                console.print(
+                    f"[dim]Index saved to {cache_file.name}  "
+                    f"({len(by_num):,} entries)[/dim]"
+                )
+        except OSError as exc:
+            if not context.output_json:
+                console.print(f"[yellow]Warning: could not write cache: {exc}[/yellow]")
+
+        return by_parent, by_num, source_name, None
+
+    # EWF / --image: cache by file stat + partition offset
+    # Determine the effective image path and partition offset.
+    if image is not None and offset is None:
+        # --offset is required with --image; delegate to _open_mft_source for the error.
+        source, source_name = _open_mft_source(file, image, offset, raw, sectors, console)
+        by_parent, by_num = _build_dir_index(source, include_deleted=True)
+        return by_parent, by_num, source_name, None
+
+    ewf_path: Path | None = None
+    _eff_offset: int = 0
+    if image is not None:
+        ewf_path = image
+        _eff_offset = offset  # validated non-None above
+    elif file is not None and _is_ewf(file):
+        ewf_path = file
+        _eff_offset = offset if offset is not None else _detect_ntfs_offset(file, console)
+
+    if ewf_path is not None:
+        cache_file = _cache_path(ewf_path)
+        st = ewf_path.stat()
+        cached = _load_index_cache(
+            cache_file, None,
+            file_size=st.st_size, file_mtime=st.st_mtime,
+            raw=False, offset=_eff_offset,
+        )
+        if cached is not None:
+            by_parent, by_num = cached
+            if not context.output_json:
+                console.print(
+                    f"[dim]Loaded index from {cache_file.name}  "
+                    f"({len(by_num):,} entries)[/dim]"
+                )
+            return by_parent, by_num, ewf_path.name, None
+
+        # Cache miss — stream the MFT
+        if not context.output_json:
+            console.print(
+                f"[dim]Streaming $MFT from {ewf_path.name} at offset {_eff_offset}…[/dim]"
+            )
+        source = _stream_mft_from_image(ewf_path, _eff_offset)
+        source_name = f"{ewf_path.name} (offset {_eff_offset})"
+        if not context.output_json:
+            console.print(f"[dim]Building directory index from {source_name}…[/dim]")
+        by_parent, by_num = _build_dir_index(source, include_deleted=True)
+
+        try:
+            _save_index_cache(
+                cache_file, by_num,
+                file_size=st.st_size, file_mtime=st.st_mtime,
+                raw=False, offset=_eff_offset,
+            )
+            if not context.output_json:
+                console.print(
+                    f"[dim]Index saved to {cache_file.name}  "
+                    f"({len(by_num):,} entries)[/dim]"
+                )
+        except OSError as exc:
+            if not context.output_json:
+                console.print(f"[yellow]Warning: could not write cache: {exc}[/yellow]")
+
+        return by_parent, by_num, source_name, None
+
+    # Fallback: no recognised source (will error in _open_mft_source)
     source, source_name = _open_mft_source(file, image, offset, raw, sectors, console)
-    if not context.output_json:
-        console.print(f"[dim]Building directory index from {source_name}…[/dim]")
     by_parent, by_num = _build_dir_index(source, include_deleted=True)
     return by_parent, by_num, source_name, None
 
@@ -1373,10 +1589,13 @@ def ls_cmd(
     # ── Flag compatibility checks ──────────────────────────────────────────
     if not context.output_json:
         _is_7z = file is not None and file.suffix.lower() == ".7z"
+        _is_ewf_file = file is not None and file.suffix.lower() in _EWF_EXTENSIONS
         if image is not None and file is not None:
             console.print("[yellow]--image is set; the positional file argument is ignored.[/yellow]")
         if _is_7z and raw:
             console.print("[yellow]--raw is ignored for .7z archive sources.[/yellow]")
+        if _is_ewf_file and raw:
+            console.print("[yellow]--raw is ignored for E01 image sources.[/yellow]")
         if check_hash and not _is_7z:
             console.print("[yellow]--check-hash only applies to .7z archives; ignored.[/yellow]")
 
@@ -1562,10 +1781,13 @@ def tree_cmd(
     # ── Flag compatibility checks ──────────────────────────────────────────
     if not context.output_json:
         _is_7z = file is not None and file.suffix.lower() == ".7z"
+        _is_ewf_file = file is not None and file.suffix.lower() in _EWF_EXTENSIONS
         if image is not None and file is not None:
             console.print("[yellow]--image is set; the positional file argument is ignored.[/yellow]")
         if _is_7z and raw:
             console.print("[yellow]--raw is ignored for .7z archive sources.[/yellow]")
+        if _is_ewf_file and raw:
+            console.print("[yellow]--raw is ignored for E01 image sources.[/yellow]")
         if check_hash and not _is_7z:
             console.print("[yellow]--check-hash only applies to .7z archives; ignored.[/yellow]")
 
