@@ -1670,6 +1670,35 @@ def ls_cmd(
 # tree command
 # ---------------------------------------------------------------------------
 
+def _compute_mft_visible_set(
+    entry_num: int,
+    by_parent: dict[int, list[_MFTEntry]],
+    show_deleted: bool,
+    pattern: re.Pattern,
+    seen: set[int] | None = None,
+) -> set[int]:
+    """Return entry numbers that match the pattern or are ancestors of a match."""
+    if seen is None:
+        seen = set()
+    if entry_num in seen:
+        return set()
+    seen.add(entry_num)
+
+    result: set[int] = set()
+    children = [c for c in by_parent.get(entry_num, []) if c.mft_num != entry_num]
+    if not show_deleted:
+        children = [c for c in children if c.is_in_use]
+
+    for child in children:
+        child_matches = any(pattern.search(name) for name in child.names)
+        desc = _compute_mft_visible_set(child.mft_num, by_parent, show_deleted, pattern, set(seen))
+        if child_matches or desc:
+            result.add(child.mft_num)
+            result.update(desc)
+
+    return result
+
+
 def _build_rich_tree(
     node: RichTree,
     entry_num: int,
@@ -1678,6 +1707,8 @@ def _build_rich_tree(
     max_depth: int,
     seen: set[int],
     show_deleted: bool = False,
+    visible: set[int] | None = None,
+    pattern: re.Pattern | None = None,
 ) -> None:
     if entry_num in seen:
         return
@@ -1688,7 +1719,7 @@ def _build_rich_tree(
         children = [c for c in children if c.is_in_use]
     children.sort(key=lambda e: (0 if e.is_dir else 1, e.label.lower()))
 
-    if current_depth >= max_depth:
+    if visible is None and current_depth >= max_depth:
         if children:
             node.add(
                 f"[dim]… {len(children)} item{'s' if len(children) != 1 else ''} "
@@ -1698,17 +1729,33 @@ def _build_rich_tree(
 
     for child in children:
         n = child.mft_num
+        if visible is not None and n not in visible:
+            continue
         names = child.names
+        is_match = pattern is not None and any(pattern.search(name) for name in names)
         num_part = f"[dim][[/dim]{n}[dim]][/dim]"
         if len(names) > 1:
             aliases = " | ".join(names[1:])
-            name_part = (
-                f"[bold]{names[0]}[/bold] [dim]| {aliases}[/dim]"
-                if child.is_dir
-                else f"{names[0]} [dim]| {aliases}[/dim]"
-            )
+            if is_match:
+                name_part = (
+                    f"[bold yellow]{names[0]}[/bold yellow] [dim]| {aliases}[/dim]"
+                    if child.is_dir
+                    else f"[yellow]{names[0]}[/yellow] [dim]| {aliases}[/dim]"
+                )
+            else:
+                name_part = (
+                    f"[bold]{names[0]}[/bold] [dim]| {aliases}[/dim]"
+                    if child.is_dir
+                    else f"{names[0]} [dim]| {aliases}[/dim]"
+                )
         else:
-            name_part = f"[bold]{names[0]}[/bold]" if child.is_dir else (names[0] if names else "?")
+            if is_match:
+                name_part = (
+                    f"[bold yellow]{names[0]}[/bold yellow]" if child.is_dir
+                    else (f"[yellow]{names[0]}[/yellow]" if names else "?")
+                )
+            else:
+                name_part = f"[bold]{names[0]}[/bold]" if child.is_dir else (names[0] if names else "?")
 
         label = (
             f"[dim]{num_part} {name_part}[/dim]"
@@ -1718,7 +1765,7 @@ def _build_rich_tree(
 
         child_node = node.add(label)
         if child.is_dir:
-            _build_rich_tree(child_node, n, by_parent, current_depth + 1, max_depth, seen, show_deleted)
+            _build_rich_tree(child_node, n, by_parent, current_depth + 1, max_depth, seen, show_deleted, visible, pattern)
 
 
 def _build_tree_dict(
@@ -1729,6 +1776,8 @@ def _build_tree_dict(
     max_depth: int,
     seen: set[int],
     show_deleted: bool = False,
+    visible: set[int] | None = None,
+    pattern: re.Pattern | None = None,
 ) -> dict:
     e = by_num.get(entry_num)
     result: dict = {
@@ -1746,13 +1795,17 @@ def _build_tree_dict(
         children = [c for c in children if c.is_in_use]
     children.sort(key=lambda x: (0 if x.is_dir else 1, x.label.lower()))
 
-    if current_depth < max_depth:
+    effective_max = max_depth if visible is None else 10 ** 9
+    if current_depth < effective_max:
         for child in children:
-            result["children"].append(
-                _build_tree_dict(child.mft_num, by_parent, by_num,
-                                 current_depth + 1, max_depth, set(seen), show_deleted)
-            )
-    elif children:
+            if visible is not None and child.mft_num not in visible:
+                continue
+            child_dict = _build_tree_dict(child.mft_num, by_parent, by_num,
+                                          current_depth + 1, max_depth, set(seen), show_deleted, visible, pattern)
+            if pattern is not None:
+                child_dict["match"] = any(pattern.search(n) for n in child.names)
+            result["children"].append(child_dict)
+    elif children and visible is None:
         result["truncated"] = len(children)
 
     return result
@@ -1768,6 +1821,7 @@ def tree_cmd(
     depth: int = typer.Option(3, "--depth", "-d", help="Maximum recursion depth (default: 3)"),
     show_deleted: bool = typer.Option(False, "--deleted", help="Include deleted entries"),
     check_hash: bool = typer.Option(False, "--check-hash", help="Verify the .7z cache against the archive SHA-256 before use"),
+    filter_pattern: Optional[str] = typer.Option(None, "--filter", "-f", help="Regex to filter entries — shows matching files/dirs and their parent path (case-insensitive)"),
 ) -> None:
     """Show a recursive directory tree from any MFT source.
 
@@ -1791,6 +1845,14 @@ def tree_cmd(
         if check_hash and not _is_7z:
             console.print("[yellow]--check-hash only applies to .7z archives; ignored.[/yellow]")
 
+    pat: re.Pattern | None = None
+    if filter_pattern:
+        try:
+            pat = re.compile(filter_pattern, re.IGNORECASE)
+        except re.error as exc:
+            console.print(f"[red]Invalid regex: {exc}[/red]")
+            raise typer.Exit(1)
+
     by_parent, by_num, source_name, cache_hint = _get_dir_index(
         file, image, offset, raw, 0, console, check_hash=check_hash
     )
@@ -1802,12 +1864,20 @@ def tree_cmd(
     root_entry = by_num.get(entry)
     root_label_name = root_entry.label if root_entry else f"#{entry}"
 
+    visible: set[int] | None = None
+    if pat is not None:
+        visible = _compute_mft_visible_set(entry, by_parent, show_deleted, pat)
+
     if context.output_json:
         print(json.dumps(
-            _build_tree_dict(entry, by_parent, by_num, 0, depth, set(), show_deleted),
+            _build_tree_dict(entry, by_parent, by_num, 0, depth, set(), show_deleted, visible, pat),
             indent=2,
         ))
         return
+
+    if pat is not None and not visible:
+        console.print(f"[yellow]No entries matching {filter_pattern!r} found.[/yellow]")
+        raise typer.Exit(0)
 
     root_label = (
         f"[dim][[/dim][bold cyan]{entry}[/bold cyan][dim]][/dim]"
@@ -1815,7 +1885,7 @@ def tree_cmd(
         f"  [dim]{source_name}[/dim]"
     )
     t = RichTree(root_label)
-    _build_rich_tree(t, entry, by_parent, 0, depth, set(), show_deleted)
+    _build_rich_tree(t, entry, by_parent, 0, depth, set(), show_deleted, visible, pat)
     console.print(t)
     if cache_hint:
         console.print(f"[dim]{cache_hint}[/dim]")

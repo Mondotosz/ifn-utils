@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -66,27 +67,70 @@ def _val_to_json(val) -> str | int | list | None:
         return None
 
 
-def _build_tree(node: Tree, key, current_depth: int, max_depth: int) -> None:
-    if current_depth >= max_depth:
+def _compute_hive_visible_paths(key, current_path: tuple, pattern: re.Pattern) -> set[tuple]:
+    """Return path tuples for keys that match the pattern or are ancestors of a match."""
+    result: set[tuple] = set()
+    for subkey in key.subkeys():
+        child_path = current_path + (subkey.name(),)
+        is_match = bool(pattern.search(subkey.name()))
+        desc_paths = _compute_hive_visible_paths(subkey, child_path, pattern)
+        if is_match or desc_paths:
+            result.add(child_path)
+            result.update(desc_paths)
+    return result
+
+
+def _build_tree(
+    node: Tree,
+    key,
+    current_depth: int,
+    max_depth: int,
+    visible_paths: set[tuple] | None = None,
+    current_path: tuple = (),
+    pattern: re.Pattern | None = None,
+) -> None:
+    if visible_paths is None and current_depth >= max_depth:
         remaining = len(list(key.subkeys()))
         if remaining:
             node.add(f"[dim]… {remaining} subkey{'s' if remaining != 1 else ''} (increase --depth to expand)[/dim]")
         return
     for subkey in key.subkeys():
-        label = f"[cyan]{subkey.name()}[/cyan]  [dim]{_fmt_ts(subkey.timestamp())}[/dim]"
+        name = subkey.name()
+        child_path = current_path + (name,)
+        if visible_paths is not None and child_path not in visible_paths:
+            continue
+        is_match = pattern is not None and bool(pattern.search(name))
+        if is_match:
+            label = f"[bold yellow]{name}[/bold yellow]  [dim]{_fmt_ts(subkey.timestamp())}[/dim]"
+        else:
+            label = f"[cyan]{name}[/cyan]  [dim]{_fmt_ts(subkey.timestamp())}[/dim]"
         child = node.add(label)
-        _build_tree(child, subkey, current_depth + 1, max_depth)
+        _build_tree(child, subkey, current_depth + 1, max_depth, visible_paths, child_path, pattern)
 
 
-def _build_tree_dict(key, current_depth: int, max_depth: int) -> dict:
+def _build_tree_dict(
+    key,
+    current_depth: int,
+    max_depth: int,
+    visible_paths: set[tuple] | None = None,
+    current_path: tuple = (),
+    pattern: re.Pattern | None = None,
+) -> dict:
     result = {
         "name": key.name(),
         "timestamp": _fmt_ts_iso(key.timestamp()),
         "children": [],
     }
-    if current_depth < max_depth:
+    effective_max = max_depth if visible_paths is None else 10 ** 9
+    if current_depth < effective_max:
         for subkey in key.subkeys():
-            result["children"].append(_build_tree_dict(subkey, current_depth + 1, max_depth))
+            child_path = current_path + (subkey.name(),)
+            if visible_paths is not None and child_path not in visible_paths:
+                continue
+            child_dict = _build_tree_dict(subkey, current_depth + 1, max_depth, visible_paths, child_path, pattern)
+            if pattern is not None:
+                child_dict["match"] = bool(pattern.search(subkey.name()))
+            result["children"].append(child_dict)
     return result
 
 
@@ -95,14 +139,26 @@ def tree(
     hive: Path = typer.Argument(..., help="Path to hive file", exists=True),
     path: Optional[str] = typer.Argument(None, help="Registry key path to start from (default: root)"),
     depth: int = typer.Option(2, "--depth", "-d", help="Maximum depth to expand"),
+    filter_pattern: Optional[str] = typer.Option(None, "--filter", "-f", help="Regex to filter keys — shows matching keys and their parent path (case-insensitive)"),
 ) -> None:
     """Show a tree view of registry subkeys up to a given depth."""
     console = context.get_console()
     reg = _open_hive(hive)
     key = _key_path(reg, path)
 
+    pat: re.Pattern | None = None
+    if filter_pattern:
+        try:
+            pat = re.compile(filter_pattern, re.IGNORECASE)
+        except re.error as exc:
+            console.print(f"[red]Invalid regex: {exc}[/red]")
+            raise typer.Exit(1)
+
     if context.output_json:
-        print(json.dumps(_build_tree_dict(key, 0, depth), indent=2))
+        visible: set[tuple] | None = None
+        if pat is not None:
+            visible = _compute_hive_visible_paths(key, (), pat)
+        print(json.dumps(_build_tree_dict(key, 0, depth, visible, (), pat), indent=2))
         return
 
     display_path = path or key.name()
@@ -111,7 +167,16 @@ def tree(
         f"  [dim]{_fmt_ts(key.timestamp())}[/dim]"
     )
     t = Tree(root_label)
-    _build_tree(t, key, 0, depth)
+
+    if pat is not None:
+        visible = _compute_hive_visible_paths(key, (), pat)
+        if not visible:
+            console.print(f"[yellow]No keys matching {filter_pattern!r} found.[/yellow]")
+            raise typer.Exit(0)
+        _build_tree(t, key, 0, depth, visible, (), pat)
+    else:
+        _build_tree(t, key, 0, depth)
+
     console.print(t)
 
 
