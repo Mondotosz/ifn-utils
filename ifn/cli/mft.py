@@ -1,6 +1,7 @@
 from __future__ import annotations
 from pathlib import Path
-from typing import Optional, Iterator
+from typing import Optional, Iterator, List
+from datetime import datetime, timezone
 from dataclasses import dataclass
 import csv
 import gzip
@@ -18,6 +19,7 @@ from rich import box
 
 from ifn import context
 from ifn.parsers import mft_record as mft_parser
+from ifn.parsers import evtx_parser
 from ifn.display.hex_table import render_hex_table
 
 app = typer.Typer(help="Parse NTFS Master File Table records")
@@ -686,23 +688,18 @@ def record(
                 )
                 raise typer.Exit(1)
             else:
-                if stream is not None:
-                    console.print(
-                        "[red]Alternate data stream extraction is not supported for "
-                        "archive sources.[/red]"
-                    )
-                    raise typer.Exit(1)
                 arc_path = archive_source.resolve_path(entry)
                 if arc_path is None:
                     console.print(
                         "[red]Could not reconstruct the file path from the MFT parent chain.[/red]"
                     )
                     raise typer.Exit(1)
-                console.print(f"[dim]Extracting '{arc_path}' from archive → {extract}…[/dim]")
-                content = archive_source.extract_file(arc_path)
+                lookup_path = f"{arc_path}·{stream}" if stream is not None else arc_path
+                console.print(f"[dim]Extracting '{lookup_path}' from archive → {extract}…[/dim]")
+                content = archive_source.extract_file(lookup_path)
                 if content is None:
                     console.print(
-                        f"[red]File not found in archive: {arc_path}[/red]\n"
+                        f"[red]File not found in archive: {lookup_path}[/red]\n"
                         "[dim]The file may have been excluded when the archive was created.[/dim]"
                     )
                     raise typer.Exit(1)
@@ -1889,3 +1886,247 @@ def tree_cmd(
     console.print(t)
     if cache_hint:
         console.print(f"[dim]{cache_hint}[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# events command — Windows Event Log (.evtx) parser
+# ---------------------------------------------------------------------------
+
+_EVTX_ROW_COLORS: dict[int, str] = {
+    1100: "red",
+    4104: "magenta",
+    4609: "red",
+    4625: "red",
+    4616: "yellow",
+    4720: "bright_yellow",
+    4648: "yellow",
+    4778: "yellow",
+    4634: "dim",
+    4608: "cyan",
+}
+
+
+def _parse_evtx_ts(ts: str | None) -> datetime | None:
+    """Parse a Windows Event Log SystemTime string to a UTC datetime."""
+    if not ts:
+        return None
+    s = ts.rstrip("Z")
+    if "." in s:
+        base, frac = s.split(".", 1)
+        s = base + "." + frac[:6].ljust(6, "0")
+    try:
+        return datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _fmt_evtx_ts(ts: str | None) -> str:
+    dt = _parse_evtx_ts(ts)
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else "—"
+
+
+def _details_str(details: dict[str, str], max_val: int = 55) -> str:
+    parts = []
+    for k, v in details.items():
+        if len(v) > max_val:
+            v = v[:max_val] + "…"
+        parts.append(f"{k}={v}")
+    return "  ".join(parts)
+
+
+def _resolve_evtx_from_mft(
+    by_num: dict[int, "_MFTEntry"],
+    evtx_path: str | None,
+    label: str,
+    console,
+) -> "_MFTEntry | None":
+    """Find a .evtx entry in a by_num dict, print discovery list if ambiguous."""
+    matches = [
+        e for e in by_num.values()
+        if not e.is_dir and any(
+            n.lower().endswith(".evtx") and (evtx_path is None or evtx_path.lower() in n.lower())
+            for n in e.names
+        )
+    ]
+    if not matches:
+        msg = f"No .evtx matching {evtx_path!r}" if evtx_path else "No .evtx files"
+        console.print(f"[red]{msg} found in {label}.[/red]")
+        return None
+    if len(matches) > 1 and evtx_path is None:
+        console.print(f"[yellow]Multiple .evtx files found in {label} — specify one with --evtx:[/yellow]")
+        for e in matches:
+            console.print(f"  [cyan]{e.names[0]}[/cyan]  [dim](entry {e.mft_num})[/dim]")
+        return None
+    return matches[0]
+
+
+@app.command("events")
+def events_cmd(
+    source: Path = typer.Argument(..., help="Path to .evtx file, 7z archive, or E01 image"),
+    evtx_path: Optional[str] = typer.Option(
+        None, "--evtx", "-e",
+        help="Path/basename to .evtx within archive or image (e.g. Security.evtx)",
+    ),
+    offset: int = typer.Option(0, "--offset", help="Partition offset in sectors (for E01 images)"),
+    event_ids: Optional[List[int]] = typer.Option(None, "--id", "-i", help="Filter by event ID (repeatable)"),
+    security_preset: bool = typer.Option(False, "--security", "-s", help="Show only forensically significant Security.evtx events"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Maximum number of records to show"),
+    since: Optional[str] = typer.Option(None, "--since", help="Only events at or after this ISO 8601 timestamp"),
+    until: Optional[str] = typer.Option(None, "--until", help="Only events before or at this ISO 8601 timestamp"),
+) -> None:
+    """Parse Windows Event Log (.evtx) records — direct file, 7z archive, or E01 image."""
+    import tempfile, os
+
+    console = context.get_console()
+
+    dt_since: datetime | None = None
+    dt_until: datetime | None = None
+    if since:
+        s = since if since.endswith("Z") else since + "Z"
+        dt_since = _parse_evtx_ts(s)
+        if dt_since is None:
+            console.print("[red]Invalid --since. Use ISO 8601, e.g. 2023-01-15T10:00:00[/red]")
+            raise typer.Exit(1)
+    if until:
+        s = until if until.endswith("Z") else until + "Z"
+        dt_until = _parse_evtx_ts(s)
+        if dt_until is None:
+            console.print("[red]Invalid --until. Use ISO 8601, e.g. 2023-01-15T23:59:59[/red]")
+            raise typer.Exit(1)
+
+    id_filter: frozenset[int] | None = None
+    if event_ids:
+        id_filter = frozenset(event_ids)
+    if security_preset:
+        preset = evtx_parser.FORENSIC_EVENT_IDS
+        id_filter = preset if id_filter is None else id_filter & preset
+
+    # Resolve the .evtx file to parse
+    evtx_file: Path
+    tmp_path: str | None = None
+
+    ext = source.suffix.lower()
+    if ext == ".evtx":
+        evtx_file = source
+    elif ext == ".7z":
+        archive = _ArchiveSource(source)
+        by_parent, by_num = _build_dir_index(archive.iter_mft(console))
+        target = _resolve_evtx_from_mft(by_num, evtx_path, source.name, console)
+        if target is None:
+            raise typer.Exit(1)
+        arc_path = archive.resolve_path(target.mft_num)
+        if arc_path is None:
+            console.print(f"[red]Cannot reconstruct archive path for entry {target.mft_num}.[/red]")
+            raise typer.Exit(1)
+        console.print(f"[dim]Extracting {arc_path} from {source.name}…[/dim]")
+        data = archive.extract_file(arc_path)
+        if data is None:
+            console.print(f"[red]Failed to extract {arc_path!r} from archive.[/red]")
+            raise typer.Exit(1)
+        fd, tmp_path = tempfile.mkstemp(suffix=".evtx")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        evtx_file = Path(tmp_path)
+    elif ext in {".e01", ".e02", ".e03", ".e04", ".e05"}:
+        by_parent, by_num = _build_dir_index(_stream_mft_from_image(source, offset))
+        target = _resolve_evtx_from_mft(by_num, evtx_path, source.name, console)
+        if target is None:
+            raise typer.Exit(1)
+        console.print(f"[dim]Extracting entry {target.mft_num} ({target.names[0]}) via icat…[/dim]")
+        result = subprocess.run(
+            ["icat", "-o", str(offset), str(source), str(target.mft_num)],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            console.print(f"[red]icat failed: {result.stderr.decode(errors='replace')}[/red]")
+            raise typer.Exit(1)
+        fd, tmp_path = tempfile.mkstemp(suffix=".evtx")
+        with os.fdopen(fd, "wb") as f:
+            f.write(result.stdout)
+        evtx_file = Path(tmp_path)
+    else:
+        console.print(
+            f"[red]Unsupported source {ext!r}. Provide a .evtx file, .7z archive, or .e01 image.[/red]"
+        )
+        raise typer.Exit(1)
+
+    try:
+        _render_events(evtx_file, id_filter, dt_since, dt_until, limit, source.name, console)
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _render_events(
+    evtx_file: Path,
+    id_filter: frozenset[int] | None,
+    dt_since: datetime | None,
+    dt_until: datetime | None,
+    limit: int | None,
+    display_name: str,
+    console,
+) -> None:
+    matched: list[dict] = []
+
+    for rec in evtx_parser.iter_records(evtx_file):
+        if id_filter is not None and rec["event_id"] not in id_filter:
+            continue
+        if dt_since is not None or dt_until is not None:
+            dt = _parse_evtx_ts(rec["timestamp"])
+            if dt is not None:
+                if dt_since is not None and dt < dt_since:
+                    continue
+                if dt_until is not None and dt > dt_until:
+                    continue
+        matched.append(rec)
+        if limit is not None and len(matched) >= limit:
+            break
+
+    if context.output_json:
+        print(json.dumps(
+            [
+                {
+                    "record_num": r["record_num"],
+                    "event_id": r["event_id"],
+                    "timestamp": r["timestamp"],
+                    "computer": r["computer"],
+                    "description": r["description"],
+                    "details": r["details"],
+                }
+                for r in matched
+            ],
+            indent=2,
+        ))
+        return
+
+    count_str = f"[cyan]{len(matched):,}[/cyan] event{'s' if len(matched) != 1 else ''}"
+    suffix = "  [dim](limit reached)[/dim]" if limit is not None and len(matched) >= limit else ""
+    console.print(f"[bold]{display_name}[/bold] — {count_str} shown{suffix}")
+
+    if not matched:
+        console.print("[dim](no matching events)[/dim]")
+        return
+
+    t = Table(box=box.SIMPLE, header_style="bold")
+    t.add_column("Timestamp (UTC)", no_wrap=True)
+    t.add_column("ID", justify="right", no_wrap=True)
+    t.add_column("Description")
+    t.add_column("Key Details")
+
+    for rec in matched:
+        eid = rec["event_id"]
+        details = rec["details"]
+        if not details and rec["fields"]:
+            details = dict(list(rec["fields"].items())[:3])
+        t.add_row(
+            _fmt_evtx_ts(rec["timestamp"]),
+            str(eid),
+            rec["description"],
+            _details_str(details),
+            style=_EVTX_ROW_COLORS.get(eid, ""),
+        )
+
+    console.print(t)

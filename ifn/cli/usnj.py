@@ -64,6 +64,9 @@ def j_cmd(
     filename: Optional[str] = typer.Option(None, "--filename",
                                             help="Only show records whose filename contains this "
                                                  "substring (case-insensitive)"),
+    start: int = typer.Option(0, "--start", "-s",
+                               help="Byte offset to begin scanning (use lowest_valid_usn from $Max "
+                                    "to skip the sparse region)"),
     csv_out: Optional[Path] = typer.Option(None, "--csv", help="Export to a CSV file"),
 ) -> None:
     """List USN_RECORD_V2 records from $UsnJrnl:$J."""
@@ -77,7 +80,7 @@ def j_cmd(
     json_rows: list[dict] = []
     shown = 0
 
-    for rec in usn.iter_records(data):
+    for rec in usn.iter_records(data, start=start):
         row_dict = rec.as_row()
         if reason and reason.upper() not in row_dict["Reason"].upper():
             continue
@@ -92,6 +95,16 @@ def j_cmd(
 
     if context.output_json:
         print(json.dumps(json_rows, indent=2))
+        return
+
+    if shown == 0:
+        console.print("[yellow]No USN V2 records found.[/yellow]")
+        if start == 0:
+            console.print(
+                "[dim]Hint: if this file is extracted from a 7z archive, the non-sparse "
+                "USN records may start at a higher offset. Check lowest_valid_usn in $Max "
+                "and rerun with --start <offset>.[/dim]"
+            )
         return
 
     table = Table(title=f"$UsnJrnl:$J — {file.name}", box=box.ROUNDED, header_style="bold")

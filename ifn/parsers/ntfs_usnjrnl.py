@@ -162,8 +162,11 @@ def iter_records(data: bytes, start: int = 0) -> Iterator[UsnRecord]:
         if length == 0:
             pos += 8                              # sparse hole
             continue
-        if length < 0x3C or pos + length > end:
+        if pos + length > end:
             break
+        if length < 0x3C:
+            pos += 8
+            continue
         major = struct.unpack_from("<H", data, pos + 4)[0]
         minor = struct.unpack_from("<H", data, pos + 6)[0]
         if major != 2:
