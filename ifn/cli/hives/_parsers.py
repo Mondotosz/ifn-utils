@@ -61,6 +61,60 @@ class SamHiveParser(ValueParser):
 # SYSTEM — MountedDevices
 # ---------------------------------------------------------------------------
 
+def _is_device_path(data: bytes) -> bool:
+    """True for UTF-16LE strings with a \\??\\ or _??_ prefix."""
+    return (len(data) >= 8 and
+            data[1] == 0x00 and
+            data[2] == 0x3F and data[3] == 0x00 and
+            data[4] == 0x3F and data[5] == 0x00 and
+            data[0] in (0x5C, 0x5F) and
+            data[6] in (0x5C, 0x5F) and data[7] == 0x00)
+
+
+def _parse_device_path(text: str) -> dict:
+    """Decompose an NT device instance path (\\??\\BusType#HwID#Serial#{GUID})."""
+    raw_parts = text.rstrip("\x00").split("#")
+    out: dict = {"path": text.rstrip("\x00")}
+
+    # Bus type is always in parts[0]: "_??_USBSTOR" or "\??\SCSI"
+    first = raw_parts[0]
+    for sep in ("_??_", "\\??\\"):
+        if first.startswith(sep):
+            out["bus_type"] = first[len(sep):]
+            break
+    else:
+        out["bus_type"] = first
+
+    parts = list(raw_parts)
+
+    # Interface GUID is the last part when it starts with '{'
+    if parts and parts[-1].startswith("{") and parts[-1].endswith("}"):
+        out["interface_guid"] = parts.pop()
+
+    # Instance ID (serial&instance) is now the last remaining part after bus type
+    if len(parts) >= 3:
+        out["instance_id"] = parts.pop()
+        # Serial is everything before the first '&' in the instance ID
+        serial, _, _ = out["instance_id"].partition("&")
+        if serial:
+            out["serial"] = serial
+
+    # Hardware ID: everything between bus type and instance ID
+    # Join with '#' to reassemble paths that had embedded '#' (e.g. HS-SD#MMC)
+    if len(parts) >= 2:
+        hw_id = "#".join(parts[1:])
+        out["hardware_id"] = hw_id
+        for seg in hw_id.split("&"):
+            if "_" in seg:
+                key, _, val = seg.partition("_")
+                if key in ("Ven", "Prod", "Rev"):
+                    out[key.lower()] = val
+            elif "device_type" not in out:
+                out["device_type"] = seg
+
+    return out
+
+
 def _parse_win_guid(data: bytes) -> str:
     d1, = struct.unpack_from("<I", data, 0)
     d2, = struct.unpack_from("<H", data, 4)
@@ -92,6 +146,10 @@ class MountedDeviceParser(SystemHiveParser):
             guid_str = _parse_win_guid(identifier) if len(identifier) == 16 else ""
             return {"type": "dmio", "guid": guid_str}
 
+        if data[:15] == b"VeraCryptVolume":
+            identifier = data.decode("ascii", errors="replace").rstrip("\x00")
+            return {"type": "veracrypt", "identifier": identifier}
+
         if len(data) == 12:
             sig, = struct.unpack_from("<I", data, 0)
             offset_b, = struct.unpack_from("<Q", data, 4)
@@ -122,6 +180,15 @@ class MountedDeviceParser(SystemHiveParser):
             except Exception:
                 pass
 
+        if _is_device_path(data):
+            try:
+                text = data.decode("utf-16-le")
+                d = _parse_device_path(text)
+                d["type"] = "device_path"
+                return d
+            except Exception:
+                pass
+
         return {"type": "unknown", "hex": data.hex(" ").upper()}
 
     def render(self, data: bytes, title: str, console) -> None:
@@ -144,6 +211,15 @@ class MountedDeviceParser(SystemHiveParser):
             render_hex_table(data, fields, title=f"{title} — DMIO:ID:", console=console)
             if guid_str:
                 console.print(f"\n  [bold]Volume identifier GUID:[/bold]  {guid_str}")
+            return
+
+        if data[:15] == b"VeraCryptVolume":
+            identifier = data.decode("ascii", errors="replace").rstrip("\x00")
+            fields: list[tuple[int, int, str, str]] = [
+                (0, len(data), "VeraCrypt volume identifier (ASCII)", identifier),
+            ]
+            render_hex_table(data, fields, title=f"{title} — VeraCrypt Volume", console=console)
+            console.print(f"\n  [bold]Identifier:[/bold]  {identifier}")
             return
 
         if len(data) == 12:
@@ -207,6 +283,38 @@ class MountedDeviceParser(SystemHiveParser):
             else:
                 fields = [(0, len(data), "Volume path (UTF-16LE)", text)]
                 render_hex_table(data, fields, title=f"{title} — Volume Path", console=console)
+            return
+
+        if _is_device_path(data):
+            try:
+                text = data.decode("utf-16-le")
+                parsed = _parse_device_path(text)
+            except Exception as e:
+                console.print(f"[red]Failed to decode device path: {e}[/red]")
+                return
+            path_str = parsed["path"]
+            fields = [(0, len(data), "Device path (UTF-16LE)", path_str[:80] + ("…" if len(path_str) > 80 else ""))]
+            render_hex_table(data, fields, title=f"{title} — Device Path", console=console)
+            t = Table(title="Device Path Components", box=box.ROUNDED, header_style="bold")
+            t.add_column("Field", style="bold", no_wrap=True)
+            t.add_column("Value")
+            t.add_row("Bus type",        parsed.get("bus_type", "—"))
+            t.add_row("Device type",     parsed.get("device_type", "—"))
+            if "ven" in parsed:
+                t.add_row("Vendor",      parsed["ven"] or "[dim](empty)[/dim]")
+            if "prod" in parsed:
+                t.add_row("Product",     parsed["prod"])
+            if "rev" in parsed:
+                t.add_row("Revision",    parsed["rev"])
+            if "serial" in parsed:
+                t.add_row("Serial",      parsed["serial"])
+            if "instance_id" in parsed:
+                t.add_row("Instance ID", parsed["instance_id"])
+            if "hardware_id" in parsed:
+                t.add_row("Hardware ID", parsed["hardware_id"])
+            if "interface_guid" in parsed:
+                t.add_row("Interface GUID", parsed["interface_guid"])
+            console.print(t)
             return
 
         fields = [(0, len(data), "Unknown data", f"{len(data)} bytes")]
