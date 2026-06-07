@@ -12,7 +12,7 @@ from rich import box
 from Registry import Registry
 
 from ifn import context
-from ifn.display.hex_table import render_hex_table
+from ifn.cli.hives._parsers import find_parsers, HEX_PARSER
 
 app = typer.Typer(help="Parse Windows Registry hive files")
 
@@ -276,6 +276,7 @@ def get(
     path: str = typer.Argument(..., help="Registry key path"),
     value: str = typer.Argument(..., help="Value name"),
     dump: Optional[Path] = typer.Option(None, "--dump", "-d", help="Dump raw value bytes to this file"),
+    show_hex: bool = typer.Option(False, "--hex", help="Always show raw hex dump alongside parsed output"),
 ) -> None:
     """Print a single registry value with its type and data."""
     console = context.get_console()
@@ -301,6 +302,42 @@ def get(
         data_str = f"Error: {e}"
         raw = None
 
+    # Build parser list: hex first (so it doesn't bury parsed output below the fold),
+    # specialized after. HexDumpParser is included when --hex is set, or as sole
+    # fallback when no specialized parser matches.
+    specialized = find_parsers(reg.hive_type().name, path, val.name() or "")
+    if show_hex:
+        parsers = [HEX_PARSER] + specialized
+    elif specialized:
+        parsers = specialized
+    else:
+        parsers = [HEX_PARSER]
+    if parsers and isinstance(raw, bytes):
+        vname = val.name() or "(Default)"
+        if context.output_json:
+            print(json.dumps({
+                "key": path,
+                "name": vname,
+                "type": vtype,
+                "parsed": {p.name: p.parse(raw) for p in parsers},
+            }, indent=2))
+        else:
+            console.print(
+                f"[bold]Key:[/bold] {path}  [dim]│[/dim]  "
+                f"[bold]Value:[/bold] {vname}  [dim]│[/dim]  "
+                f"[bold]Type:[/bold] {vtype}  [dim]│[/dim]  "
+                f"[bold]Length:[/bold] {len(raw)} bytes"
+            )
+            for i, parser in enumerate(parsers):
+                if i > 0:
+                    console.rule()
+                parser.render(raw, vname, console)
+        if dump is not None:
+            dump.write_bytes(raw)
+            console.print(f"[green]Dumped {len(raw)} bytes to {dump}[/green]")
+        return
+
+    # Non-binary values (RegSZ, RegDWORD, etc.)
     if context.output_json:
         print(json.dumps({
             "key": path,
@@ -310,35 +347,19 @@ def get(
         }, indent=2))
         return
 
-    if isinstance(raw, bytes):
-        vname = val.name() or "(Default)"
-        console.print(
-            f"[bold]Key:[/bold] {path}  [dim]│[/dim]  "
-            f"[bold]Value:[/bold] {vname}  [dim]│[/dim]  "
-            f"[bold]Type:[/bold] {vtype}  [dim]│[/dim]  "
-            f"[bold]Length:[/bold] {len(raw)} bytes"
-        )
-        render_hex_table(
-            raw,
-            [(0, len(raw), "Data", f"{vtype}  {len(raw)} bytes")],
-            title=f"{vname} ({vtype})",
-            console=console,
-        )
-    else:
-        console.print(Panel(
-            f"[bold]Key:[/bold]   {path}\n"
-            f"[bold]Value:[/bold] {val.name() or '(Default)'}\n"
-            f"[bold]Type:[/bold]  {vtype}\n"
-            f"[bold]Data:[/bold]  {data_str}",
-            title="Registry Value",
-            border_style="green",
-        ))
+    console.print(Panel(
+        f"[bold]Key:[/bold]   {path}\n"
+        f"[bold]Value:[/bold] {val.name() or '(Default)'}\n"
+        f"[bold]Type:[/bold]  {vtype}\n"
+        f"[bold]Data:[/bold]  {data_str}",
+        title="Registry Value",
+        border_style="green",
+    ))
 
     if dump is not None:
-        if not isinstance(raw, bytes):
-            console.print(f"[yellow]Warning: value type is {vtype}, not REG_BINARY — dumping as-is may not be useful[/yellow]")
-        dump.write_bytes(raw if isinstance(raw, bytes) else str(raw).encode())
-        console.print(f"[green]Dumped {len(raw) if isinstance(raw, bytes) else len(str(raw))} bytes to {dump}[/green]")
+        console.print(f"[yellow]Warning: value type is {vtype}, not REG_BINARY — dumping as-is may not be useful[/yellow]")
+        dump.write_bytes(str(raw).encode())
+        console.print(f"[green]Dumped {len(str(raw))} bytes to {dump}[/green]")
 
 
 # Register per-hive sub-apps at the bottom to avoid circular imports

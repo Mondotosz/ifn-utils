@@ -11,8 +11,10 @@ from rich import box
 from Registry import Registry
 
 from ifn import context
-from ifn.display.hex_table import render_hex_table
 from ifn.parsers.windows_time import filetime_to_datetime
+from ifn.cli.hives._parsers import MountedDeviceParser
+
+_MOUNTED_PARSER = MountedDeviceParser()
 
 app = typer.Typer(help="SYSTEM hive analysis")
 
@@ -204,17 +206,6 @@ def _write_csv(path: Path, headers: list[str], rows: list[list[str]], console) -
     console.print(f"[green]✓ Exported {len(rows)} row(s) → {path}[/green]")
 
 
-def _parse_win_guid(data: bytes) -> str:
-    """Format 16 bytes in Windows GUID binary encoding to a GUID string."""
-    d1, = struct.unpack_from("<I", data, 0)
-    d2, = struct.unpack_from("<H", data, 4)
-    d3, = struct.unpack_from("<H", data, 6)
-    d4 = data[8:16]
-    return (f"{{{d1:08X}-{d2:04X}-{d3:04X}-"
-            f"{d4[0]:02X}{d4[1]:02X}-"
-            f"{''.join(f'{b:02X}' for b in d4[2:])}}}")
-
-
 @app.command(name="mounted-devices-bin")
 def mounted_devices_bin(
     file: Path = typer.Argument(..., help="Path to binary dump of a MountedDevices value", exists=True),
@@ -234,121 +225,8 @@ def mounted_devices_bin(
         console.print("[red]Empty file.[/red]")
         raise typer.Exit(1)
 
-    # --- DMIO:ID: (dynamic / LDM disk) ---
-    if data[:8] == b"DMIO:ID:":
-        identifier = data[8:24] if len(data) >= 24 else data[8:]
-        guid_str = _parse_win_guid(identifier) if len(identifier) == 16 else ""
-        fields: list[tuple[int, int, str, str]] = [
-            (0x00, 8, "Magic", "DMIO:ID:  (LDM dynamic disk)"),
-        ]
-        if len(identifier) >= 16:
-            d1, = struct.unpack_from("<I", identifier, 0)
-            d2, = struct.unpack_from("<H", identifier, 4)
-            d3, = struct.unpack_from("<H", identifier, 6)
-            fields += [
-                (0x08, 4, "GUID Data1 (LE)", f"0x{d1:08X}"),
-                (0x0C, 2, "GUID Data2 (LE)", f"0x{d2:04X}"),
-                (0x0E, 2, "GUID Data3 (LE)", f"0x{d3:04X}"),
-                (0x10, 8, "GUID Data4 (BE)", identifier[8:16].hex(" ").upper()),
-            ]
-        if context.output_json:
-            print(json.dumps({"type": "dmio", "guid": guid_str}, indent=2))
-            return
-        render_hex_table(data, fields, title=f"MountedDevices — DMIO:ID: — {file.name}", console=console)
-        if guid_str:
-            console.print(f"\n  [bold]Volume identifier GUID:[/bold]  {guid_str}")
-        return
-
-    # --- MBR basic disk (12 bytes) ---
-    if len(data) == 12:
-        sig, = struct.unpack_from("<I", data, 0)
-        offset_b, = struct.unpack_from("<Q", data, 4)
-        offset_s = offset_b // 512
-        fields = [
-            (0, 4, "MBR disk signature", f"0x{sig:08X}"),
-            (4, 8, "Partition byte offset", f"{offset_b:,} bytes  → sector {offset_s:,}  ({offset_b / 2**20:.1f} MiB)"),
-        ]
-        if context.output_json:
-            print(json.dumps({
-                "type": "mbr",
-                "disk_signature": f"0x{sig:08X}",
-                "partition_byte_offset": offset_b,
-                "partition_sector_offset": offset_s,
-            }, indent=2))
-            return
-        render_hex_table(data, fields, title=f"MountedDevices — MBR Partition — {file.name}", console=console)
-        return
-
-    # --- GPT partition (16 bytes) ---
-    if len(data) == 16:
-        guid_str = _parse_win_guid(data)
-        d1, = struct.unpack_from("<I", data, 0)
-        d2, = struct.unpack_from("<H", data, 4)
-        d3, = struct.unpack_from("<H", data, 6)
-        fields = [
-            (0,  4, "GUID Data1 (LE)", f"0x{d1:08X}"),
-            (4,  2, "GUID Data2 (LE)", f"0x{d2:04X}"),
-            (6,  2, "GUID Data3 (LE)", f"0x{d3:04X}"),
-            (8,  2, "GUID Data4[0:2]", data[8:10].hex(" ").upper()),
-            (10, 6, "GUID Data4[2:8]", data[10:16].hex(" ").upper()),
-        ]
-        if context.output_json:
-            print(json.dumps({"type": "gpt", "partition_guid": guid_str}, indent=2))
-            return
-        render_hex_table(data, fields, title=f"MountedDevices — GPT Partition GUID — {file.name}", console=console)
-        console.print(f"\n  [bold]Partition GUID:[/bold]  {guid_str}")
-        return
-
-    # --- UTF-16LE GUID string ({DiskGUID}#PartitionByteOffsetHex) ---
-    if len(data) >= 2 and data[0] == 0x7B and data[1] == 0x00:
-        try:
-            text = data.decode("utf-16-le")
-        except Exception as e:
-            console.print(f"[red]Failed to decode as UTF-16LE: {e}[/red]")
-            raise typer.Exit(1)
-
-        if "#" in text:
-            guid_part, _, offset_hex = text.partition("#")
-            guid_len = len(guid_part) * 2        # bytes consumed by GUID chars
-            sep_off = guid_len
-            val_off = sep_off + 2                # skip '#' (2 bytes in UTF-16LE)
-            val_len = len(data) - val_off
-
-            partition_offset: int | None = None
-            offset_label = offset_hex
-            try:
-                partition_offset = int(offset_hex, 16)
-                offset_label = (f"0x{offset_hex.upper()}  → "
-                                f"{partition_offset:,} bytes  "
-                                f"(sector {partition_offset // 512:,}, "
-                                f"{partition_offset / 2**20:.1f} MiB)")
-            except ValueError:
-                pass
-
-            fields = [
-                (0,       guid_len, "Disk GUID (UTF-16LE)", guid_part),
-                (sep_off, 2,        "Separator",            "#"),
-                (val_off, val_len,  "Partition byte offset (hex string)", offset_label),
-            ]
-            if context.output_json:
-                out: dict = {"type": "guid_string", "disk_guid": guid_part}
-                if partition_offset is not None:
-                    out["partition_byte_offset"] = partition_offset
-                    out["partition_sector_offset"] = partition_offset // 512
-                print(json.dumps(out, indent=2))
-                return
-            render_hex_table(data, fields, title=f"MountedDevices — GUID String — {file.name}", console=console)
-        else:
-            fields = [(0, len(data), "Volume path (UTF-16LE)", text)]
-            if context.output_json:
-                print(json.dumps({"type": "guid_string", "path": text}, indent=2))
-                return
-            render_hex_table(data, fields, title=f"MountedDevices — Volume Path — {file.name}", console=console)
-        return
-
-    # --- Unknown format ---
-    fields = [(0, len(data), "Unknown data", f"{len(data)} bytes")]
     if context.output_json:
-        print(json.dumps({"type": "unknown", "hex": data.hex(" ").upper()}, indent=2))
+        print(json.dumps(_MOUNTED_PARSER.parse(data), indent=2))
         return
-    render_hex_table(data, fields, title=f"MountedDevices — Unknown — {file.name}", console=console)
+
+    _MOUNTED_PARSER.render(data, f"MountedDevices — {file.name}", console)
