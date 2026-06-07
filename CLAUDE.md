@@ -65,7 +65,7 @@ tool.py [--json] [--simple]
   usnj j     <file> [opts]         # $UsnJrnl:$J records (--start for sparse skip)
   hives tree/ls/info/get <hive>    # Generic hive navigation; get auto-dispatches binary values via _parsers.py
   hives sam   users/groups <hive>  # SAM hive — accounts, groups
-  hives system info/usb <hive>     # SYSTEM hive — config, USB devices
+  hives system info/usb <hive>     # SYSTEM hive — config, USB devices (USBSTOR + MountedDevices, correlated)
   hives system mounted-devices-bin <file>  # Parse a raw MountedDevices binary value (uses MountedDeviceParser directly)
   hives software info/autorun/profiles <hive>
   hives ntuser activity/env/shellbags <hive>
@@ -224,3 +224,5 @@ Common traps when adding new features:
 - **`image usnjrnl`** reads $J via `icat` from a live E01 (complete data). **`usnj j`** reads a pre-extracted raw stream dump (may only have the sparse region).
 - **`MountedDeviceParser` detection order matters:** VeraCrypt entries are exactly 16 bytes (`VeraCryptVolume*` ASCII) and must be checked *before* the 16-byte GPT GUID branch, otherwise they're misidentified. Device paths (`\??\` or `_??_` prefix in UTF-16LE) must also be checked separately — the `\??\` prefix starts with `0x5C` (not `0x7B`), so it won't match the GUID string handler.
 - **Device path hardware IDs can contain `#`** (e.g. `HS-SD#MMC`). Parse from both ends: strip interface GUID last, strip instance ID second-to-last, then rejoin remaining middle parts with `#` for the hardware ID.
+- **`mft events` EVTX matching uses exact basename first, substring fallback.** When multiple files share a suffix (e.g. `Security.evtx` and `SMBServer%4Security.evtx`), a bare `--evtx Security.evtx` matches exactly; substring is only tried if no exact match is found. Implemented in `_resolve_evtx_from_mft()`.
+- **`hives system usb`** uses `MountedDeviceParser` to parse MountedDevices values and correlates USBSTOR serials (strip `&N` suffix) to drive letters. JSON includes `friendly_name` and `drive_letters` per USBSTOR entry, and full `parsed` dict per MountedDevices entry. Hint commands for `hives ls`/`get` are printed after each section in console mode.

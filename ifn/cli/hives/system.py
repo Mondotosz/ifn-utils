@@ -143,18 +143,32 @@ def usb(
     console = context.get_console()
     reg = _open_hive(hive)
 
-    usb_rows: list[tuple[str, str, str]] = []
+    # --- USBSTOR ---
+    usb_entries: list[dict] = []
     try:
         usbstor = reg.open(f"{controlset}\\Enum\\USBSTOR")
         for dev_key in usbstor.subkeys():
             for serial_key in dev_key.subkeys():
                 ts = serial_key.timestamp()
                 ts_str = ts.strftime("%Y-%m-%d %H:%M:%S UTC") if ts else "—"
-                usb_rows.append((dev_key.name(), serial_key.name(), ts_str))
+                friendly = ""
+                try:
+                    friendly = serial_key.value("FriendlyName").value() or ""
+                except Exception:
+                    pass
+                usb_entries.append({
+                    "device": dev_key.name(),
+                    "serial": serial_key.name(),
+                    "last_connected": ts_str,
+                    "friendly_name": friendly,
+                    "drives": [],
+                })
     except Registry.RegistryKeyNotFoundException:
         pass
 
-    mount_rows: list[tuple[str, str]] = []
+    # --- MountedDevices (parse with MountedDeviceParser) ---
+    md_entries: list[dict] = []
+    serial_to_drives: dict[str, list[str]] = {}
     try:
         md_key = reg.open("MountedDevices")
         for val in md_key.values():
@@ -162,38 +176,98 @@ def usb(
             if not name.startswith(("\\DosDevices\\", "\\??\\")):
                 continue
             raw = val.value()
-            hex_id = raw[:12].hex(" ").upper() if isinstance(raw, bytes) else str(raw)[:40]
-            mount_rows.append((name, hex_id))
+            if not isinstance(raw, bytes):
+                continue
+            parsed = _MOUNTED_PARSER.parse(raw)
+            if parsed.get("type") == "device_path" and name.startswith("\\DosDevices\\"):
+                serial = parsed.get("serial", "")
+                if serial:
+                    drive = name[len("\\DosDevices\\"):]
+                    serial_to_drives.setdefault(serial, []).append(drive)
+            md_entries.append({"mount_point": name, "raw": raw, "parsed": parsed})
     except Registry.RegistryKeyNotFoundException:
         pass
 
+    # Correlate drive letters back to USBSTOR entries (serial key has "&N" suffix)
+    for entry in usb_entries:
+        bare = entry["serial"].split("&")[0]
+        entry["drives"] = serial_to_drives.get(bare, [])
+
+    # --- JSON ---
     if context.output_json:
         print(json.dumps({
-            "usbstor": [{"device": d, "serial": s, "last_connected": t} for d, s, t in usb_rows],
-            "mounted_devices": [{"mount_point": m, "identifier_hex": h} for m, h in mount_rows],
+            "usbstor": [
+                {
+                    "device": e["device"],
+                    "serial": e["serial"],
+                    "friendly_name": e["friendly_name"] or None,
+                    "last_connected": e["last_connected"],
+                    "drive_letters": e["drives"],
+                }
+                for e in usb_entries
+            ],
+            "mounted_devices": [
+                {"mount_point": e["mount_point"], "parsed": e["parsed"]}
+                for e in md_entries
+            ],
         }, indent=2))
         return
 
+    # --- USBSTOR table ---
     usb_table = Table(title="USB Storage Devices (USBSTOR)", box=box.ROUNDED, header_style="bold")
     usb_table.add_column("Device string")
     usb_table.add_column("Serial")
+    usb_table.add_column("Friendly name", style="dim")
     usb_table.add_column("Last connected")
-    for device, serial, ts_str in usb_rows:
-        usb_table.add_row(device, serial, ts_str)
-    if usb_rows:
+    usb_table.add_column("Drive(s)")
+    for e in usb_entries:
+        usb_table.add_row(
+            e["device"], e["serial"], e["friendly_name"] or "—",
+            e["last_connected"], ", ".join(e["drives"]) or "—",
+        )
+    if usb_entries:
         console.print(usb_table)
     else:
         console.print("[dim]No USB storage devices found.[/dim]")
+    console.print(
+        f"[dim]  → hives ls {hive} '{controlset}\\Enum\\USBSTOR'[/dim]"
+    )
 
-    mount_table = Table(title="Mounted Devices", box=box.ROUNDED, header_style="bold")
-    mount_table.add_column("Mount point")
-    mount_table.add_column("Identifier (first 12 bytes hex)")
-    for mount_point, hex_id in mount_rows:
-        mount_table.add_row(mount_point, hex_id)
-    if mount_rows:
-        console.print(mount_table)
+    # --- MountedDevices table ---
+    def _md_ident(p: dict, raw: bytes) -> str:
+        t = p.get("type", "")
+        if t == "mbr":
+            return f"MBR sig {p.get('disk_signature', '')}, sector {p.get('partition_sector_offset')}"
+        if t == "gpt":
+            return f"GPT part GUID {p.get('partition_guid', '')}"
+        if t == "dmio":
+            return f"DMIO {p.get('volume_id', '')}"
+        if t == "veracrypt":
+            return p.get("identifier", "VeraCrypt")
+        if t == "guid_string":
+            return f"Disk {p.get('disk_guid', '')}, sector {p.get('partition_sector_offset')}"
+        if t == "device_path":
+            return f"Serial {p.get('serial', '')}  ({p.get('hardware_id', '')})"
+        return raw[:12].hex(" ").upper()
 
+    md_table = Table(title="Mounted Devices", box=box.ROUNDED, header_style="bold")
+    md_table.add_column("Mount point")
+    md_table.add_column("Type")
+    md_table.add_column("Identifier / Device")
+    for e in md_entries:
+        p = e["parsed"]
+        md_table.add_row(e["mount_point"], p.get("type", "unknown"), _md_ident(p, e["raw"]))
+    if md_entries:
+        console.print(md_table)
+    console.print(
+        f"[dim]  → hives ls {hive} 'MountedDevices'[/dim]\n"
+        f"[dim]  → hives get {hive} MountedDevices '\\DosDevices\\C:'[/dim]"
+    )
+
+    # --- CSV ---
     if csv_out is not None:
+        usb_rows = [(e["device"], e["serial"], e["last_connected"]) for e in usb_entries]
+        mount_rows = [(e["mount_point"], e["raw"][:12].hex(" ").upper()) for e in md_entries]
         _write_csv(_csv_path(csv_out, "usbstor"), _USBSTOR_HEADERS, [list(r) for r in usb_rows], console)
         _write_csv(_csv_path(csv_out, "mounted"), _MOUNTED_HEADERS, [list(r) for r in mount_rows], console)
 

@@ -1941,13 +1941,18 @@ def _resolve_evtx_from_mft(
     console,
 ) -> "_MFTEntry | None":
     """Find a .evtx entry in a by_num dict, print discovery list if ambiguous."""
-    matches = [
+    all_evtx = [
         e for e in by_num.values()
-        if not e.is_dir and any(
-            n.lower().endswith(".evtx") and (evtx_path is None or evtx_path.lower() in n.lower())
-            for n in e.names
-        )
+        if not e.is_dir and any(n.lower().endswith(".evtx") for n in e.names)
     ]
+    if evtx_path is None:
+        matches = all_evtx
+    else:
+        # Exact basename match first, substring fallback
+        needle = evtx_path.lower()
+        matches = [e for e in all_evtx if any(n.lower() == needle for n in e.names)]
+        if not matches:
+            matches = [e for e in all_evtx if any(needle in n.lower() for n in e.names)]
     if not matches:
         msg = f"No .evtx matching {evtx_path!r}" if evtx_path else "No .evtx files"
         console.print(f"[red]{msg} found in {label}.[/red]")
