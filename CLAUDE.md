@@ -181,13 +181,19 @@ For `mft record`, after displaying $SI and $FN attributes, compare their `_ticks
 ### Class hierarchy
 
 ```
-ValueParser (ABC)          — name: str, matches(), parse() → dict, render()
-  SystemHiveParser         — matches hive_type == "SYSTEM"
-    MountedDeviceParser    — MountedDevices key; 6 formats (DMIO, VeraCrypt, MBR, GPT, GUID string, device path)
-  SamHiveParser            — matches hive_type == "SAM"
-    SamUserVParser         — SAM\Domains\Account\Users\*, value "V"
-    SamUserFParser         — SAM\Domains\Account\Users\*, value "F"
-  HexDumpParser            — not in _PARSERS; exported as HEX_PARSER singleton
+ValueParser (ABC)              — name: str, matches(), parse() → dict, render()
+  SystemHiveParser             — matches hive_type == "SYSTEM"
+    SystemShutdownTimeParser   — ControlSet*\Control\Windows, value "ShutdownTime"; FILETIME → datetime
+    MountedDeviceParser        — MountedDevices key; 6 formats (DMIO, VeraCrypt, MBR, GPT, GUID string, device path)
+  SamHiveParser                — matches hive_type == "SAM"
+    SamUserVParser             — SAM\Domains\Account\Users\*, value "V"
+    SamUserFParser             — SAM\Domains\Account\Users\*, value "F"
+    SamGroupCParser            — SAM\Domains\*\Aliases\*, value "C"; group name at offsets 0x10/0x14
+  NtUserHiveParser             — matches hive_type == "NTUSER"
+    RecentDocParser            — Explorer\RecentDocs\*, numeric value; filename extraction
+  MRUListExParser              — any hive, value "MRUListEx"; 4-byte int array MRU order
+  ShellItemParser              — any hive, "BagMRU" in key path, numeric value; shell item decode
+  HexDumpParser                — not in _PARSERS; exported as HEX_PARSER singleton
 ```
 
 `_PARSERS` contains only specialized parsers. `find_parsers(hive_type, key_path, value_name)` returns the matching subset. `HexDumpParser` is exported separately as `HEX_PARSER` and included by `get()` based on the `--hex` flag:
@@ -229,4 +235,5 @@ Common traps when adding new features:
 - **`mft events` EVTX matching uses exact basename first, substring fallback.** When multiple files share a suffix (e.g. `Security.evtx` and `SMBServer%4Security.evtx`), a bare `--evtx Security.evtx` matches exactly; substring is only tried if no exact match is found. Implemented in `_resolve_evtx_from_mft()`.
 - **`mft events` extracts EVTX to a persistent cache** next to the source file: `<source_stem>.<evtx_basename>` (e.g. `exhibits/evidence.Security.evtx` for `evidence.7z`). On subsequent runs the cache is reused without re-extracting. Implemented via `_evtx_cache_path()`. Delete the file to force re-extraction.
 - **`hives system usb`** uses `MountedDeviceParser` to parse MountedDevices values and correlates USBSTOR serials (strip `&N` suffix) to drive letters. JSON includes `friendly_name` and `drive_letters` per USBSTOR entry, and full `parsed` dict per MountedDevices entry. Hint commands for `hives ls`/`get` are printed after each section in console mode.
+- **`SamGroupCParser` uses offsets 0x10/0x14**, not 0x24/0x28, for the name field descriptor in the SAM alias C blob. The `_try_group_name()` helper in `sam.py` uses 0x24/0x28 which only works for Account (non-builtin) aliases — it returns `""` for all Builtin aliases. The corrected offsets work for both.
 - **`hives tree --notable` uses `_find_notable_paths()`** which returns `dict[tuple, dict[str, list[str]]]` — key path tuple → `{value_name: [parser_names]}`. The outer dict is used to compute visible paths; the inner dict is used by `--values` to highlight individual notable values. Do not flatten it to `list[str]` — that loses per-value granularity needed for `--values` highlighting.

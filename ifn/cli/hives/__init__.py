@@ -21,6 +21,11 @@ _PARSER_COLORS: dict[str, str] = {
     "mounted_device": "magenta",
     "sam_user_v":     "green",
     "sam_user_f":     "yellow",
+    "shutdown_time":  "red",
+    "sam_group_c":    "blue",
+    "mru_list_ex":    "cyan",
+    "shell_item":     "bright_green",
+    "recent_doc":     "bright_yellow",
 }
 _PARSER_COLOR_FALLBACK = "blue"
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import re
 import struct
 from abc import ABC, abstractmethod
 
@@ -55,6 +56,49 @@ class SamHiveParser(ValueParser):
 
     def matches(self, hive_type: str, key_path: str, value_name: str) -> bool:
         return hive_type == "SAM"
+
+
+class NtUserHiveParser(ValueParser):
+    """Base for NTUSER.DAT hive parsers."""
+
+    def matches(self, hive_type: str, key_path: str, value_name: str) -> bool:
+        return hive_type == "NTUSER"
+
+
+# ---------------------------------------------------------------------------
+# SYSTEM — ShutdownTime
+# ---------------------------------------------------------------------------
+
+class SystemShutdownTimeParser(SystemHiveParser):
+    """Parses the ShutdownTime FILETIME value under ControlSet*\\Control\\Windows."""
+
+    name = "shutdown_time"
+
+    def matches(self, hive_type: str, key_path: str, value_name: str) -> bool:
+        return (super().matches(hive_type, key_path, value_name)
+                and key_path.lower().endswith("control\\windows")
+                and value_name == "ShutdownTime")
+
+    def parse(self, data: bytes) -> dict:
+        if len(data) < 8:
+            return {"timestamp": None, "error": "too short"}
+        ticks, = struct.unpack_from("<Q", data)
+        if ticks == 0:
+            return {"timestamp": None}
+        from ifn.parsers.windows_time import filetime_to_datetime
+        dt = filetime_to_datetime(ticks)
+        return {"timestamp": dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"}
+
+    def render(self, data: bytes, title: str, console) -> None:
+        from ifn.parsers.windows_time import fmt_filetime
+        if len(data) < 8:
+            console.print("[red]ShutdownTime: too short[/red]")
+            return
+        ticks, = struct.unpack_from("<Q", data)
+        ts_str = fmt_filetime(ticks)
+        fields: list[tuple[int, int, str, str]] = [(0, 8, "ShutdownTime (FILETIME)", ts_str)]
+        render_hex_table(data, fields, title=f"{title} — Shutdown Time", console=console)
+        console.print(f"\n  [bold]Last shutdown:[/bold]  {ts_str}")
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +468,221 @@ class SamUserFParser(SamHiveParser):
 
 
 # ---------------------------------------------------------------------------
+# SAM — group alias C blob
+# ---------------------------------------------------------------------------
+
+def _extract_group_name(data: bytes) -> str:
+    """Extract the group name from a SAM alias C blob.
+
+    Name field descriptor is at offsets 0x10 (rel) and 0x14 (length in bytes),
+    relative to data section base at 0x34.
+    """
+    try:
+        BASE = 0x34
+        rel = struct.unpack_from("<I", data, 0x10)[0]
+        ln  = struct.unpack_from("<I", data, 0x14)[0]
+        if 0 < ln <= 256:
+            start = BASE + rel
+            raw = data[start: start + ln]
+            candidate = raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+            if candidate and all(0x20 <= ord(c) <= 0x7E or c in (" ", "\t") for c in candidate):
+                return candidate
+    except Exception:
+        pass
+    return ""
+
+
+class SamGroupCParser(SamHiveParser):
+    """Parses the C (alias metadata) blob for SAM local groups."""
+
+    name = "sam_group_c"
+
+    def matches(self, hive_type: str, key_path: str, value_name: str) -> bool:
+        return (super().matches(hive_type, key_path, value_name)
+                and "aliases\\" in key_path.lower()
+                and value_name == "C")
+
+    def parse(self, data: bytes) -> dict:
+        return {"group_name": _extract_group_name(data) or None}
+
+    def render(self, data: bytes, title: str, console) -> None:
+        name = _extract_group_name(data)
+        fields: list[tuple[int, int, str, str]] = []
+        if name:
+            try:
+                BASE = 0x34
+                rel = struct.unpack_from("<I", data, 0x10)[0]
+                ln  = struct.unpack_from("<I", data, 0x14)[0]
+                fields = [
+                    (0x10, 4, "Name offset (relative to 0x34)", str(rel)),
+                    (0x14, 4, "Name length (bytes)", str(ln)),
+                    (BASE + rel, ln, "Name (UTF-16LE)", name),
+                ]
+            except Exception:
+                pass
+        if not fields:
+            fields = [(0, len(data), "C blob", f"{len(data)} bytes")]
+        render_hex_table(data, fields, title=f"{title} — SAM Group Alias", console=console)
+        if name:
+            console.print(f"\n  [bold]Group name:[/bold]  {name}")
+
+
+# ---------------------------------------------------------------------------
+# NTUSER — MRUListEx (universal MRU order array)
+# ---------------------------------------------------------------------------
+
+def _decode_mrulistex(data: bytes) -> list[int]:
+    order = []
+    for i in range(0, len(data) - 3, 4):
+        idx, = struct.unpack_from("<I", data, i)
+        if idx == 0xFFFFFFFF:
+            break
+        order.append(idx)
+    return order
+
+
+class MRUListExParser(ValueParser):
+    """Parses MRUListEx binary values (4-byte int array, terminated by 0xFFFFFFFF)."""
+
+    name = "mru_list_ex"
+
+    def matches(self, hive_type: str, key_path: str, value_name: str) -> bool:
+        return value_name == "MRUListEx"
+
+    def parse(self, data: bytes) -> dict:
+        return {"order": _decode_mrulistex(data)}
+
+    def render(self, data: bytes, title: str, console) -> None:
+        order = _decode_mrulistex(data)
+        fields: list[tuple[int, int, str, str]] = []
+        for i, idx in enumerate(order):
+            fields.append((i * 4, 4, f"MRU slot {i}", str(idx)))
+        term_off = len(order) * 4
+        if term_off + 4 <= len(data):
+            fields.append((term_off, 4, "Terminator", "0xFFFFFFFF"))
+        render_hex_table(data, fields, title=f"{title} — MRUListEx", console=console)
+        console.print(f"\n  [bold]MRU order (most-recent first):[/bold]  {order}")
+
+
+# ---------------------------------------------------------------------------
+# NTUSER — BagMRU shell items
+# ---------------------------------------------------------------------------
+
+_BEEF0004 = 0xBEEF0004
+_BEEF_UNICODE_OFFSET: dict[int, int] = {3: 0x12, 7: 0x22, 8: 0x1E, 9: 0x30}
+
+
+def _extract_unicode_name(data: bytes, short_name_end: int) -> str:
+    pos = short_name_end + 1
+    if pos % 2:
+        pos += 1
+    if pos + 8 > len(data):
+        return ""
+    ext_size = struct.unpack_from("<H", data, pos)[0]
+    if ext_size < 8 or pos + ext_size > len(data):
+        return ""
+    version = struct.unpack_from("<H", data, pos + 2)[0]
+    sig     = struct.unpack_from("<I", data, pos + 4)[0]
+    if sig != _BEEF0004:
+        return ""
+    uni_off = _BEEF_UNICODE_OFFSET.get(version, 0)
+    if not uni_off:
+        return ""
+    name_start = pos + uni_off
+    if name_start + 2 > len(data):
+        return ""
+    i = name_start
+    while i + 1 < len(data) and not (data[i] == 0 and data[i + 1] == 0):
+        i += 2
+    raw = data[name_start:i]
+    try:
+        return raw.decode("utf-16-le", errors="replace") if raw else ""
+    except Exception:
+        return ""
+
+
+def _decode_shellitem(data: bytes) -> str:
+    if len(data) < 3:
+        return data.hex(" ").upper()
+    item_type = data[2]
+    try:
+        if item_type == 0x1F:
+            return "[Desktop / Special Folder]"
+        if item_type == 0x2F:
+            return chr(data[3]) + ":\\"
+        if item_type in (0x31, 0x32, 0xB1):
+            end = data.find(b"\x00", 0x0E)
+            if end > 0x0E:
+                short = data[0x0E:end].decode("ascii", errors="replace")
+                if all(0x20 <= ord(c) < 0x7F for c in short):
+                    long_name = _extract_unicode_name(data, end)
+                    return long_name if long_name else short
+        if item_type == 0x74:
+            end = data.find(b"\x00", 5)
+            if end > 5:
+                return data[5:end].decode("ascii", errors="replace")
+    except Exception:
+        pass
+    return f"[type=0x{item_type:02X}] " + data[:16].hex(" ").upper()
+
+
+class ShellItemParser(ValueParser):
+    """Parses numeric shell item entries under BagMRU keys."""
+
+    name = "shell_item"
+
+    def matches(self, hive_type: str, key_path: str, value_name: str) -> bool:
+        return "bagmru" in key_path.lower() and bool(re.match(r"^\d+$", value_name))
+
+    def parse(self, data: bytes) -> dict:
+        return {"name": _decode_shellitem(data)}
+
+    def render(self, data: bytes, title: str, console) -> None:
+        name = _decode_shellitem(data)
+        label = name[:80] + ("…" if len(name) > 80 else "")
+        fields: list[tuple[int, int, str, str]] = [(0, len(data), "Shell item", label)]
+        render_hex_table(data, fields, title=f"{title} — BagMRU Shell Item", console=console)
+        console.print(f"\n  [bold]Decoded:[/bold]  {name}")
+
+
+# ---------------------------------------------------------------------------
+# NTUSER — RecentDocs entries
+# ---------------------------------------------------------------------------
+
+def _decode_recent_name(data: bytes) -> str:
+    i = 0
+    while i < len(data):
+        if 0x20 <= data[i] <= 0x7E:
+            j = i
+            while j < len(data) and 0x20 <= data[j] <= 0x7E:
+                j += 1
+            if j - i >= 4:
+                return data[i:j].decode("ascii", errors="replace")
+        i += 1
+    return data[:32].hex(" ").upper()
+
+
+class RecentDocParser(NtUserHiveParser):
+    """Parses numeric entries under Explorer\\RecentDocs (and subkeys by extension)."""
+
+    name = "recent_doc"
+
+    def matches(self, hive_type: str, key_path: str, value_name: str) -> bool:
+        return (super().matches(hive_type, key_path, value_name)
+                and "recentdocs" in key_path.lower()
+                and bool(re.match(r"^\d+$", value_name)))
+
+    def parse(self, data: bytes) -> dict:
+        return {"name": _decode_recent_name(data)}
+
+    def render(self, data: bytes, title: str, console) -> None:
+        name = _decode_recent_name(data)
+        fields: list[tuple[int, int, str, str]] = [(0, len(data), "RecentDoc entry", name)]
+        render_hex_table(data, fields, title=f"{title} — Recent Document", console=console)
+        console.print(f"\n  [bold]Document name:[/bold]  {name}")
+
+
+# ---------------------------------------------------------------------------
 # Default — raw hex dump (always last, always matches)
 # ---------------------------------------------------------------------------
 
@@ -457,9 +716,14 @@ class HexDumpParser(ValueParser):
 # ---------------------------------------------------------------------------
 
 _PARSERS: list[ValueParser] = [
+    SystemShutdownTimeParser(),
     MountedDeviceParser(),
     SamUserVParser(),
     SamUserFParser(),
+    SamGroupCParser(),
+    MRUListExParser(),
+    ShellItemParser(),
+    RecentDocParser(),
 ]
 
 HEX_PARSER = HexDumpParser()
