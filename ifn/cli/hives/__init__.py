@@ -16,6 +16,22 @@ from ifn.cli.hives._parsers import find_parsers, HEX_PARSER
 
 app = typer.Typer(help="Parse Windows Registry hive files")
 
+# Colors per specialized parser name (used in --notable tree view)
+_PARSER_COLORS: dict[str, str] = {
+    "mounted_device": "magenta",
+    "sam_user_v":     "green",
+    "sam_user_f":     "yellow",
+}
+_PARSER_COLOR_FALLBACK = "blue"
+
+
+def _parser_badges(parser_names: list[str]) -> str:
+    parts = []
+    for name in parser_names:
+        c = _PARSER_COLORS.get(name, _PARSER_COLOR_FALLBACK)
+        parts.append(f"[{c}]{name}[/{c}]")
+    return "  ".join(parts)
+
 
 def _open_hive(path: Path) -> Registry.Registry:
     console = context.get_console()
@@ -67,6 +83,57 @@ def _val_to_json(val) -> str | int | list | None:
         return None
 
 
+def _find_notable_paths(
+    key, hive_type: str, base_path: str | None, current_path: tuple
+) -> "dict[tuple, dict[str, list[str]]]":
+    """Recursively find keys whose values match a specialized parser.
+
+    Returns a dict mapping path-tuples (relative to the starting key) to a
+    sub-dict of {value_name: [parser_names]} for every parseable value in that key.
+    """
+    result: dict[tuple, dict[str, list[str]]] = {}
+
+    if base_path and current_path:
+        key_path_str = base_path + "\\" + "\\".join(current_path)
+    elif current_path:
+        key_path_str = "\\".join(current_path)
+    else:
+        key_path_str = base_path or ""
+
+    val_matches: dict[str, list[str]] = {}
+    for val in key.values():
+        vname = val.name() or ""
+        parsers = find_parsers(hive_type, key_path_str, vname)
+        if parsers:
+            val_matches[vname or "(Default)"] = [p.name for p in parsers]
+    if val_matches:
+        result[current_path] = val_matches
+
+    for subkey in key.subkeys():
+        child_path = current_path + (subkey.name(),)
+        result.update(_find_notable_paths(subkey, hive_type, base_path, child_path))
+    return result
+
+
+def _notable_visible_paths(notable: "dict[tuple, dict[str, list[str]]]") -> set[tuple]:
+    """Return all path tuples that should be shown: notable keys and their ancestors."""
+    visible: set[tuple] = set()
+    for path in notable:
+        for i in range(len(path) + 1):
+            visible.add(path[:i])
+    return visible
+
+
+def _key_parser_badges(notable: "dict[tuple, dict[str, list[str]]]", path: tuple) -> str:
+    """Aggregate all parser names for a key's values into a badge string."""
+    seen: list[str] = []
+    for parsers in notable[path].values():
+        for p in parsers:
+            if p not in seen:
+                seen.append(p)
+    return _parser_badges(seen)
+
+
 def _compute_hive_visible_paths(key, current_path: tuple, pattern: re.Pattern) -> set[tuple]:
     """Return path tuples for keys that match the pattern or are ancestors of a match."""
     result: set[tuple] = set()
@@ -88,8 +155,10 @@ def _build_tree(
     visible_paths: set[tuple] | None = None,
     current_path: tuple = (),
     pattern: re.Pattern | None = None,
+    notable: "dict[tuple, dict[str, list[str]]] | None" = None,
+    show_values: bool = False,
 ) -> None:
-    if visible_paths is None and current_depth >= max_depth:
+    if visible_paths is None and notable is None and current_depth >= max_depth:
         remaining = len(list(key.subkeys()))
         if remaining:
             node.add(f"[dim]… {remaining} subkey{'s' if remaining != 1 else ''} (increase --depth to expand)[/dim]")
@@ -100,12 +169,29 @@ def _build_tree(
         if visible_paths is not None and child_path not in visible_paths:
             continue
         is_match = pattern is not None and bool(pattern.search(name))
+        badges = ("  " + _key_parser_badges(notable, child_path)) if (notable and child_path in notable) else ""
         if is_match:
-            label = f"[bold yellow]{name}[/bold yellow]  [dim]{_fmt_ts(subkey.timestamp())}[/dim]"
+            label = f"[bold yellow]{name}[/bold yellow]{badges}  [dim]{_fmt_ts(subkey.timestamp())}[/dim]"
+        elif badges:
+            label = f"[bold cyan]{name}[/bold cyan]{badges}  [dim]{_fmt_ts(subkey.timestamp())}[/dim]"
         else:
             label = f"[cyan]{name}[/cyan]  [dim]{_fmt_ts(subkey.timestamp())}[/dim]"
         child = node.add(label)
-        _build_tree(child, subkey, current_depth + 1, max_depth, visible_paths, child_path, pattern)
+        _build_tree(child, subkey, current_depth + 1, max_depth, visible_paths, child_path, pattern, notable, show_values)
+
+    if show_values:
+        val_notable = notable.get(current_path, {}) if notable else {}
+        for val in key.values():
+            vname = val.name() or "(Default)"
+            try:
+                vtype = val.value_type_str()
+            except Exception:
+                vtype = "?"
+            if vname in val_notable:
+                badges = "  " + _parser_badges(val_notable[vname])
+                node.add(f"[bold]▪ {vname}[/bold]{badges}  [dim]{vtype}[/dim]")
+            else:
+                node.add(f"[dim]▪ {vname}  {vtype}[/dim]")
 
 
 def _build_tree_dict(
@@ -115,22 +201,39 @@ def _build_tree_dict(
     visible_paths: set[tuple] | None = None,
     current_path: tuple = (),
     pattern: re.Pattern | None = None,
+    notable: "dict[tuple, dict[str, list[str]]] | None" = None,
+    show_values: bool = False,
 ) -> dict:
-    result = {
+    result: dict = {
         "name": key.name(),
         "timestamp": _fmt_ts_iso(key.timestamp()),
         "children": [],
     }
-    effective_max = max_depth if visible_paths is None else 10 ** 9
+    if notable is not None and current_path in notable:
+        result["parsers"] = list(dict.fromkeys(
+            p for ps in notable[current_path].values() for p in ps
+        ))
+    effective_max = max_depth if (visible_paths is None and notable is None) else 10 ** 9
     if current_depth < effective_max:
         for subkey in key.subkeys():
             child_path = current_path + (subkey.name(),)
             if visible_paths is not None and child_path not in visible_paths:
                 continue
-            child_dict = _build_tree_dict(subkey, current_depth + 1, max_depth, visible_paths, child_path, pattern)
+            child_dict = _build_tree_dict(subkey, current_depth + 1, max_depth, visible_paths, child_path, pattern, notable, show_values)
             if pattern is not None:
                 child_dict["match"] = bool(pattern.search(subkey.name()))
             result["children"].append(child_dict)
+    if show_values:
+        val_notable = notable.get(current_path, {}) if notable else {}
+        vals = []
+        for val in key.values():
+            vname = val.name() or "(Default)"
+            entry: dict = {"name": vname, "type": val.value_type_str()}
+            if vname in val_notable:
+                entry["parsers"] = val_notable[vname]
+            vals.append(entry)
+        if vals:
+            result["values"] = vals
     return result
 
 
@@ -140,6 +243,8 @@ def tree(
     path: Optional[str] = typer.Argument(None, help="Registry key path to start from (default: root)"),
     depth: int = typer.Option(2, "--depth", "-d", help="Maximum depth to expand"),
     filter_pattern: Optional[str] = typer.Option(None, "--filter", "-f", help="Regex to filter keys — shows matching keys and their parent path (case-insensitive)"),
+    show_notable: bool = typer.Option(False, "--notable", "-n", help="Show only keys that have values matched by a specialized parser, highlighted by parser type"),
+    show_values: bool = typer.Option(False, "--values", "-v", help="Show key values as leaf nodes; with --notable, highlights parseable values"),
 ) -> None:
     """Show a tree view of registry subkeys up to a given depth."""
     console = context.get_console()
@@ -154,11 +259,22 @@ def tree(
             console.print(f"[red]Invalid regex: {exc}[/red]")
             raise typer.Exit(1)
 
+    notable_map: "dict[tuple, dict[str, list[str]]] | None" = None
+    visible: set[tuple] | None = None
+
+    if show_notable:
+        notable_map = _find_notable_paths(key, reg.hive_type().name, path, ())
+        if not notable_map:
+            console.print("[yellow]No keys with specialized parsers found.[/yellow]")
+            raise typer.Exit(0)
+        visible = _notable_visible_paths(notable_map)
+
+    if pat is not None:
+        pat_visible = _compute_hive_visible_paths(key, (), pat)
+        visible = pat_visible if visible is None else (visible | pat_visible)
+
     if context.output_json:
-        visible: set[tuple] | None = None
-        if pat is not None:
-            visible = _compute_hive_visible_paths(key, (), pat)
-        print(json.dumps(_build_tree_dict(key, 0, depth, visible, (), pat), indent=2))
+        print(json.dumps(_build_tree_dict(key, 0, depth, visible, (), pat, notable_map, show_values), indent=2))
         return
 
     display_path = path or key.name()
@@ -168,14 +284,13 @@ def tree(
     )
     t = Tree(root_label)
 
-    if pat is not None:
-        visible = _compute_hive_visible_paths(key, (), pat)
-        if not visible:
+    if visible is not None:
+        if not visible and not show_notable:
             console.print(f"[yellow]No keys matching {filter_pattern!r} found.[/yellow]")
             raise typer.Exit(0)
-        _build_tree(t, key, 0, depth, visible, (), pat)
+        _build_tree(t, key, 0, depth, visible, (), pat, notable_map, show_values)
     else:
-        _build_tree(t, key, 0, depth)
+        _build_tree(t, key, 0, depth, show_values=show_values)
 
     console.print(t)
 
