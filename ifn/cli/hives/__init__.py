@@ -217,7 +217,17 @@ def ls(
     key = _key_path(reg, path)
     display_path = path or key.name()
 
+    hive_type = reg.hive_type().name
+
     if context.output_json:
+        def _val_entry(v) -> dict:
+            parsers = find_parsers(hive_type, display_path, v.name() or "")
+            return {
+                "name": v.name() or "(Default)",
+                "type": v.value_type_str(),
+                "data": _val_to_json(v),
+                "parsers": [p.name for p in parsers],
+            }
         print(json.dumps({
             "key": display_path,
             "last_written": _fmt_ts_iso(key.timestamp()),
@@ -225,10 +235,7 @@ def ls(
                 {"name": sk.name(), "last_written": _fmt_ts_iso(sk.timestamp())}
                 for sk in key.subkeys()
             ],
-            "values": [
-                {"name": v.name() or "(Default)", "type": v.value_type_str(), "data": _val_to_json(v)}
-                for v in key.values()
-            ],
+            "values": [_val_entry(v) for v in key.values()],
         }, indent=2))
         return
 
@@ -250,6 +257,7 @@ def ls(
         v_table.add_column("Name")
         v_table.add_column("Type")
         v_table.add_column("Data")
+        v_table.add_column("Parsers", style="dim")
         for val in values:
             name = val.name() or "(Default)"
             vtype = val.value_type_str()
@@ -263,7 +271,9 @@ def ls(
                     data_str = str(raw)
             except Exception as e:
                 data_str = f"[red]Error: {e}[/red]"
-            v_table.add_row(name, vtype, data_str)
+            parsers = find_parsers(hive_type, display_path, val.name() or "")
+            parsers_str = " | ".join(p.name for p in parsers) if parsers else ""
+            v_table.add_row(name, vtype, data_str, parsers_str)
         console.print(v_table)
 
     if not subkeys and not values:

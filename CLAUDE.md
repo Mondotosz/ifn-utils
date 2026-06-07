@@ -66,7 +66,7 @@ tool.py [--json] [--simple]
   hives tree/ls/info/get <hive>    # Generic hive navigation; get auto-dispatches binary values via _parsers.py
   hives sam   users/groups <hive>  # SAM hive — accounts, groups
   hives system info/usb <hive>     # SYSTEM hive — config, USB devices
-  hives system mounted-devices-bin <file>  # Parse a raw MountedDevices dump (uses MountedDeviceParser directly)
+  hives system mounted-devices-bin <file>  # Parse a raw MountedDevices binary value (uses MountedDeviceParser directly)
   hives software info/autorun/profiles <hive>
   hives ntuser activity/env/shellbags <hive>
   hives security secrets <hive>
@@ -181,7 +181,7 @@ For `mft record`, after displaying $SI and $FN attributes, compare their `_ticks
 ```
 ValueParser (ABC)          — name: str, matches(), parse() → dict, render()
   SystemHiveParser         — matches hive_type == "SYSTEM"
-    MountedDeviceParser    — MountedDevices key; 4 formats (DMIO, MBR, GPT, GUID string)
+    MountedDeviceParser    — MountedDevices key; 6 formats (DMIO, VeraCrypt, MBR, GPT, GUID string, device path)
   SamHiveParser            — matches hive_type == "SAM"
     SamUserVParser         — SAM\Domains\Account\Users\*, value "V"
     SamUserFParser         — SAM\Domains\Account\Users\*, value "F"
@@ -191,6 +191,8 @@ ValueParser (ABC)          — name: str, matches(), parse() → dict, render()
 `_PARSERS` contains only specialized parsers. `find_parsers(hive_type, key_path, value_name)` returns the matching subset. `HexDumpParser` is exported separately as `HEX_PARSER` and included by `get()` based on the `--hex` flag:
 - No `--hex`: hex dump shown only when no specialized parser matches (fallback).
 - `--hex`: hex dump shown first (before specialized output, so parsed results aren't buried by the large hex table).
+
+`hives ls` also calls `find_parsers` for each value and shows the result as a **Parsers** column (`name1 | name2` in the console table, array in JSON). Only specialized parsers appear — `HexDumpParser` is excluded since it matches every binary value and would add noise.
 
 ### Output format
 
@@ -220,3 +222,5 @@ Common traps when adding new features:
 - **E01 images** are mounted via `ewfmount` to a temp directory, which is cleaned up on exit. The mount point is cached in `ewf/` within the working directory.
 - **`mft scan` / `mft ls` / `mft tree`** all build from the MFT index cache. If the cache is stale (source file changed), delete `<source>.mftidx` to force rebuild.
 - **`image usnjrnl`** reads $J via `icat` from a live E01 (complete data). **`usnj j`** reads a pre-extracted raw stream dump (may only have the sparse region).
+- **`MountedDeviceParser` detection order matters:** VeraCrypt entries are exactly 16 bytes (`VeraCryptVolume*` ASCII) and must be checked *before* the 16-byte GPT GUID branch, otherwise they're misidentified. Device paths (`\??\` or `_??_` prefix in UTF-16LE) must also be checked separately — the `\??\` prefix starts with `0x5C` (not `0x7B`), so it won't match the GUID string handler.
+- **Device path hardware IDs can contain `#`** (e.g. `HS-SD#MMC`). Parse from both ends: strip interface GUID last, strip instance ID second-to-last, then rejoin remaining middle parts with `#` for the hardware ID.
