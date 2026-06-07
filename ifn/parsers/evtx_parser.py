@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Iterator
@@ -6,6 +7,7 @@ from typing import Iterator
 import Evtx.Evtx as evtx_lib
 
 _NS = "http://schemas.microsoft.com/win/2004/08/events/event"
+_EVENT_ID_RE = re.compile(r"<EventID[^>]*>(\d+)</EventID>")
 
 SECURITY_EVENT_NAMES: dict[int, str] = {
     1100: "Logging service stopped",
@@ -85,12 +87,20 @@ def parse_record_xml(xml_str: str) -> dict | None:
     }
 
 
-def iter_records(path: str | Path) -> Iterator[dict]:
-    """Yield parsed event dicts from an .evtx file path."""
+def iter_records(path: str | Path, id_filter: frozenset[int] | None = None) -> Iterator[dict]:
+    """Yield parsed event dicts from an .evtx file path.
+
+    id_filter: if provided, skip records whose EventID is not in the set using
+    a fast regex pre-check before full XML parsing.
+    """
     with evtx_lib.Evtx(str(path)) as log:
         for record in log.records():
             try:
                 xml = record.xml()
+                if id_filter is not None:
+                    m = _EVENT_ID_RE.search(xml)
+                    if m is None or int(m.group(1)) not in id_filter:
+                        continue
                 parsed = parse_record_xml(xml)
                 if parsed is not None:
                     parsed["record_num"] = record.record_num()

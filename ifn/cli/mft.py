@@ -1974,6 +1974,21 @@ def _evtx_cache_path(source: Path, evtx_basename: str) -> Path:
     return source.parent / (source.stem + "." + evtx_basename)
 
 
+def _find_cached_evtx(source: Path, evtx_path: str | None) -> Path | None:
+    """Return an existing EVTX cache path derivable from evtx_path without MFT scanning.
+
+    Only works when evtx_path is an exact basename (e.g. 'Security.evtx').
+    Returns None if not determinable or cache does not exist.
+    """
+    if evtx_path is None:
+        return None
+    name = Path(evtx_path).name
+    if not name.lower().endswith(".evtx"):
+        name += ".evtx"
+    candidate = _evtx_cache_path(source, name)
+    return candidate if candidate.exists() else None
+
+
 @app.command("events")
 def events_cmd(
     source: Path = typer.Argument(..., help="Path to .evtx file, 7z archive, or E01 image"),
@@ -2020,51 +2035,59 @@ def events_cmd(
     if ext == ".evtx":
         evtx_file = source
     elif ext == ".7z":
-        archive = _ArchiveSource(source)
-        by_parent, by_num = _build_dir_index(archive.iter_mft(console))
-        target = _resolve_evtx_from_mft(by_num, evtx_path, source.name, console)
-        if target is None:
-            raise typer.Exit(1)
-        evtx_name = target.names[0]
-        cache_file = _evtx_cache_path(source, evtx_name)
-        if cache_file.exists():
-            console.print(f"[dim]Using cached {evtx_name} ({cache_file})[/dim]")
-            evtx_file = cache_file
+        evtx_file = _find_cached_evtx(source, evtx_path)
+        if evtx_file is not None:
+            console.print(f"[dim]Using cached {evtx_file.name[len(source.stem)+1:]} ({evtx_file})[/dim]")
         else:
-            arc_path = archive.resolve_path(target.mft_num)
-            if arc_path is None:
-                console.print(f"[red]Cannot reconstruct archive path for entry {target.mft_num}.[/red]")
+            by_parent, by_num, _, _ = _get_dir_index(source, None, None, False, 0, console)
+            target = _resolve_evtx_from_mft(by_num, evtx_path, source.name, console)
+            if target is None:
                 raise typer.Exit(1)
-            console.print(f"[dim]Extracting {arc_path} from {source.name}…[/dim]")
-            data = archive.extract_file(arc_path)
-            if data is None:
-                console.print(f"[red]Failed to extract {arc_path!r} from archive.[/red]")
-                raise typer.Exit(1)
-            cache_file.write_bytes(data)
-            console.print(f"[dim]Saved to {cache_file}[/dim]")
-            evtx_file = cache_file
+            evtx_name = target.names[0]
+            cache_file = _evtx_cache_path(source, evtx_name)
+            if cache_file.exists():
+                console.print(f"[dim]Using cached {evtx_name} ({cache_file})[/dim]")
+                evtx_file = cache_file
+            else:
+                archive = _ArchiveSource(source)
+                arc_path = archive.resolve_path(target.mft_num)
+                if arc_path is None:
+                    console.print(f"[red]Cannot reconstruct archive path for entry {target.mft_num}.[/red]")
+                    raise typer.Exit(1)
+                console.print(f"[dim]Extracting {arc_path} from {source.name}…[/dim]")
+                data = archive.extract_file(arc_path)
+                if data is None:
+                    console.print(f"[red]Failed to extract {arc_path!r} from archive.[/red]")
+                    raise typer.Exit(1)
+                cache_file.write_bytes(data)
+                console.print(f"[dim]Saved to {cache_file}[/dim]")
+                evtx_file = cache_file
     elif ext in {".e01", ".e02", ".e03", ".e04", ".e05"}:
-        by_parent, by_num = _build_dir_index(_stream_mft_from_image(source, offset))
-        target = _resolve_evtx_from_mft(by_num, evtx_path, source.name, console)
-        if target is None:
-            raise typer.Exit(1)
-        evtx_name = target.names[0]
-        cache_file = _evtx_cache_path(source, evtx_name)
-        if cache_file.exists():
-            console.print(f"[dim]Using cached {evtx_name} ({cache_file})[/dim]")
-            evtx_file = cache_file
+        evtx_file = _find_cached_evtx(source, evtx_path)
+        if evtx_file is not None:
+            console.print(f"[dim]Using cached {evtx_file.name[len(source.stem)+1:]} ({evtx_file})[/dim]")
         else:
-            console.print(f"[dim]Extracting entry {target.mft_num} ({evtx_name}) via icat…[/dim]")
-            result = subprocess.run(
-                ["icat", "-o", str(offset), str(source), str(target.mft_num)],
-                capture_output=True,
-            )
-            if result.returncode != 0:
-                console.print(f"[red]icat failed: {result.stderr.decode(errors='replace')}[/red]")
+            by_parent, by_num, _, _ = _get_dir_index(source, None, offset or None, False, 0, console)
+            target = _resolve_evtx_from_mft(by_num, evtx_path, source.name, console)
+            if target is None:
                 raise typer.Exit(1)
-            cache_file.write_bytes(result.stdout)
-            console.print(f"[dim]Saved to {cache_file}[/dim]")
-            evtx_file = cache_file
+            evtx_name = target.names[0]
+            cache_file = _evtx_cache_path(source, evtx_name)
+            if cache_file.exists():
+                console.print(f"[dim]Using cached {evtx_name} ({cache_file})[/dim]")
+                evtx_file = cache_file
+            else:
+                console.print(f"[dim]Extracting entry {target.mft_num} ({evtx_name}) via icat…[/dim]")
+                result = subprocess.run(
+                    ["icat", "-o", str(offset), str(source), str(target.mft_num)],
+                    capture_output=True,
+                )
+                if result.returncode != 0:
+                    console.print(f"[red]icat failed: {result.stderr.decode(errors='replace')}[/red]")
+                    raise typer.Exit(1)
+                cache_file.write_bytes(result.stdout)
+                console.print(f"[dim]Saved to {cache_file}[/dim]")
+                evtx_file = cache_file
     else:
         console.print(
             f"[red]Unsupported source {ext!r}. Provide a .evtx file, .7z archive, or .e01 image.[/red]"
@@ -2085,9 +2108,7 @@ def _render_events(
 ) -> None:
     matched: list[dict] = []
 
-    for rec in evtx_parser.iter_records(evtx_file):
-        if id_filter is not None and rec["event_id"] not in id_filter:
-            continue
+    for rec in evtx_parser.iter_records(evtx_file, id_filter):
         if dt_since is not None or dt_until is not None:
             dt = _parse_evtx_ts(rec["timestamp"])
             if dt is not None:
