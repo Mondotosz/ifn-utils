@@ -1965,6 +1965,15 @@ def _resolve_evtx_from_mft(
     return matches[0]
 
 
+def _evtx_cache_path(source: Path, evtx_basename: str) -> Path:
+    """Return the persistent cache path for an extracted EVTX file.
+
+    Stored next to the source as <source_stem>.<evtx_basename>, e.g.
+    exhibits/evidence.Security.evtx for exhibits/evidence.7z + Security.evtx.
+    """
+    return source.parent / (source.stem + "." + evtx_basename)
+
+
 @app.command("events")
 def events_cmd(
     source: Path = typer.Argument(..., help="Path to .evtx file, 7z archive, or E01 image"),
@@ -1980,8 +1989,6 @@ def events_cmd(
     until: Optional[str] = typer.Option(None, "--until", help="Only events before or at this ISO 8601 timestamp"),
 ) -> None:
     """Parse Windows Event Log (.evtx) records — direct file, 7z archive, or E01 image."""
-    import tempfile, os
-
     console = context.get_console()
 
     dt_since: datetime | None = None
@@ -2008,7 +2015,6 @@ def events_cmd(
 
     # Resolve the .evtx file to parse
     evtx_file: Path
-    tmp_path: str | None = None
 
     ext = source.suffix.lower()
     if ext == ".evtx":
@@ -2019,50 +2025,53 @@ def events_cmd(
         target = _resolve_evtx_from_mft(by_num, evtx_path, source.name, console)
         if target is None:
             raise typer.Exit(1)
-        arc_path = archive.resolve_path(target.mft_num)
-        if arc_path is None:
-            console.print(f"[red]Cannot reconstruct archive path for entry {target.mft_num}.[/red]")
-            raise typer.Exit(1)
-        console.print(f"[dim]Extracting {arc_path} from {source.name}…[/dim]")
-        data = archive.extract_file(arc_path)
-        if data is None:
-            console.print(f"[red]Failed to extract {arc_path!r} from archive.[/red]")
-            raise typer.Exit(1)
-        fd, tmp_path = tempfile.mkstemp(suffix=".evtx")
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        evtx_file = Path(tmp_path)
+        evtx_name = target.names[0]
+        cache_file = _evtx_cache_path(source, evtx_name)
+        if cache_file.exists():
+            console.print(f"[dim]Using cached {evtx_name} ({cache_file})[/dim]")
+            evtx_file = cache_file
+        else:
+            arc_path = archive.resolve_path(target.mft_num)
+            if arc_path is None:
+                console.print(f"[red]Cannot reconstruct archive path for entry {target.mft_num}.[/red]")
+                raise typer.Exit(1)
+            console.print(f"[dim]Extracting {arc_path} from {source.name}…[/dim]")
+            data = archive.extract_file(arc_path)
+            if data is None:
+                console.print(f"[red]Failed to extract {arc_path!r} from archive.[/red]")
+                raise typer.Exit(1)
+            cache_file.write_bytes(data)
+            console.print(f"[dim]Saved to {cache_file}[/dim]")
+            evtx_file = cache_file
     elif ext in {".e01", ".e02", ".e03", ".e04", ".e05"}:
         by_parent, by_num = _build_dir_index(_stream_mft_from_image(source, offset))
         target = _resolve_evtx_from_mft(by_num, evtx_path, source.name, console)
         if target is None:
             raise typer.Exit(1)
-        console.print(f"[dim]Extracting entry {target.mft_num} ({target.names[0]}) via icat…[/dim]")
-        result = subprocess.run(
-            ["icat", "-o", str(offset), str(source), str(target.mft_num)],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            console.print(f"[red]icat failed: {result.stderr.decode(errors='replace')}[/red]")
-            raise typer.Exit(1)
-        fd, tmp_path = tempfile.mkstemp(suffix=".evtx")
-        with os.fdopen(fd, "wb") as f:
-            f.write(result.stdout)
-        evtx_file = Path(tmp_path)
+        evtx_name = target.names[0]
+        cache_file = _evtx_cache_path(source, evtx_name)
+        if cache_file.exists():
+            console.print(f"[dim]Using cached {evtx_name} ({cache_file})[/dim]")
+            evtx_file = cache_file
+        else:
+            console.print(f"[dim]Extracting entry {target.mft_num} ({evtx_name}) via icat…[/dim]")
+            result = subprocess.run(
+                ["icat", "-o", str(offset), str(source), str(target.mft_num)],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                console.print(f"[red]icat failed: {result.stderr.decode(errors='replace')}[/red]")
+                raise typer.Exit(1)
+            cache_file.write_bytes(result.stdout)
+            console.print(f"[dim]Saved to {cache_file}[/dim]")
+            evtx_file = cache_file
     else:
         console.print(
             f"[red]Unsupported source {ext!r}. Provide a .evtx file, .7z archive, or .e01 image.[/red]"
         )
         raise typer.Exit(1)
 
-    try:
-        _render_events(evtx_file, id_filter, dt_since, dt_until, limit, source.name, console)
-    finally:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    _render_events(evtx_file, id_filter, dt_since, dt_until, limit, source.name, console)
 
 
 def _render_events(
